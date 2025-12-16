@@ -53,23 +53,21 @@ int resolve_member_path(void *base_addr,
 {
     if (!base_addr || !base_type || !path || !out_addr || !out_type) return -1;
 
-    const VarType *t = base_type;
+    const VarType *t = vt_unwrap(base_type);
     void *addr = base_addr;
-    char tok[128];
 
+    /* IMPORTANT: base_addr is a pointer VALUE for pointer args */
+    if (t && t->kind == VT_POINTER) {
+        t = vt_unwrap(t->pointee);
+        /* addr stays as-is: points to the struct object */
+    }
+
+    char tok[128];
     const char *p = path;
+
     while (*p) {
         p = path_next(p, tok, sizeof(tok));
         if (!tok[0]) return -2;
-
-        t = vt_unwrap(t);
-
-        if (t && t->kind == VT_POINTER) {
-            /* Follow pointer value stored at 'addr' */
-            memcpy(&addr, addr, sizeof(void*));
-            if (!addr) return -3;
-            t = t->pointee;
-        }
 
         t = vt_unwrap(t);
         if (!t || (t->kind != VT_STRUCT && t->kind != VT_UNION)) return -4;
@@ -79,12 +77,26 @@ int resolve_member_path(void *base_addr,
 
         addr = (uint8_t*)addr + (size_t)m->offset;
         t = m->type;
+
+        /* If there is more path to traverse and current field is a pointer,
+           follow the pointer value stored in this field. */
+        if (*p) {
+            const VarType *ut = vt_unwrap(t);
+            if (ut && ut->kind == VT_POINTER) {
+                void *next = NULL;
+                memcpy(&next, addr, sizeof(void*)); /* reads pointer value from field */
+                if (!next) return -3;
+                addr = next;
+                t = ut->pointee;
+            }
+        }
     }
 
     *out_addr = addr;
     *out_type = t;
     return 0;
 }
+
 
 /* ======================= TEMP read (stub) ======================= */
 
@@ -146,6 +158,12 @@ static int is_cstring_ptr(const VarType *t)
     if (!p || p->kind != VT_BASE) return 0;
     if (!p->name) return 0;
     return (strcmp(p->name, "char") == 0 || strcmp(p->name, "signed char") == 0 || strcmp(p->name, "unsigned char") == 0);
+}
+
+static int is_pointer_type(const VarType *t)
+{
+    t = vt_unwrap(t);
+    return t && t->kind == VT_POINTER;
 }
 
 /* Parse arg index from "arg{n}" */
@@ -558,10 +576,16 @@ void demo_pipeline(const char *func_name)
         return;
     }
 
+    void **dummy_ptrs = calloc(f->n_args, sizeof(void*));  /* keep to free later */
     for (size_t i = 0; i < f->n_args; i++) {
-        raw_args[i] = (uint64_t)(0x1000 + i * 0x10);
-        if (i == 0) raw_args[i] = 10; // for demo
-        if (i == 1) raw_args[i] = 19; // for demo
+        if (is_pointer_type(f->args[i])) {
+            dummy_ptrs[i] = calloc(1, 256);      /* dummy struct memory */
+            raw_args[i] = (uint64_t)dummy_ptrs[i];
+        } else {
+            raw_args[i] = (uint64_t)(10 + (int)i); /* simple integer-ish values */
+            if (i == 0) raw_args[i] = 10; // for demo
+            if (i == 1) raw_args[i] = 19; // for demo
+        }
     }
 
     /* 5) Evaluate trigger expressions */
@@ -571,6 +595,8 @@ void demo_pipeline(const char *func_name)
         printf("  trigger[%zu] %s => %s\n", k, expr, ok ? "TRUE" : "FALSE");
     }
 
+    for (size_t i = 0; i < f->n_args; i++) free(dummy_ptrs[i]);
+    free(dummy_ptrs);
     free(raw_args);
     cfg_free(&cfg);
     dwarf_model_free(model);

@@ -5,6 +5,6 @@ TraceCondition:
     Recursive: false
     TriggerFunc: update_tree
     Triggers:
-      # - arg0 == 10 && arg1 < 20
+      - arg0 == 10 && arg1 < 20
       - arg5.orientation = 2 || arg5.child.orientation = 3
       # - auto arg0 arg1
