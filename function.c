@@ -9,6 +9,28 @@
 #include "libdwscan.h"
 #include "trace_config.h"
 
+/* =================== Timing helpers ==================== */
+#include <time.h>
+
+static inline void timer_start(struct timespec *t)
+{
+    clock_gettime(CLOCK_MONOTONIC, t);
+}
+
+static inline void timer_end(const struct timespec *t0, const char *label, size_t iterations)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double elapsed =
+        (t1.tv_sec  - t0->tv_sec) +
+        (t1.tv_nsec - t0->tv_nsec) * 1e-9;
+
+    printf("[time] %s: %.6f sec\n", label ? label : "elapsed", elapsed);
+    if (iterations > 0) {
+        printf("        %.3f nsec per iteration\n", (elapsed * 1e9) / (double)iterations);
+    }
+}
 
 /* ======================= Helpers ======================= */
 
@@ -594,6 +616,14 @@ void demo_pipeline(const char *func_name)
         int ok = eval_trigger_expr(expr, f, raw_args);
         printf("  trigger[%zu] %s => %s\n", k, expr, ok ? "TRUE" : "FALSE");
     }
+
+    struct timespec time;
+    timer_start(&time);
+
+    for (int i = 0; i < 1000000; i++)
+        eval_trigger_expr(t->triggers.items[0], f, raw_args);
+
+    timer_end(&time, "1M evaluations", 1000000);
 
     for (size_t i = 0; i < f->n_args; i++) free(dummy_ptrs[i]);
     free(dummy_ptrs);

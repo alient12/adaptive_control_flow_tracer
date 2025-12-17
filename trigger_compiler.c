@@ -30,6 +30,29 @@
 /* ======================= Shared model (from libdwscan) ======================= */
 #include "libdwscan.h"
 
+/* ============================== Timing helpers =============================== */
+#include <time.h>
+
+static inline void timer_start(struct timespec *t)
+{
+    clock_gettime(CLOCK_MONOTONIC, t);
+}
+
+static inline void timer_end(const struct timespec *t0, const char *label, size_t iterations)
+{
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    double elapsed =
+        (t1.tv_sec  - t0->tv_sec) +
+        (t1.tv_nsec - t0->tv_nsec) * 1e-9;
+
+    printf("[time] %s: %.6f sec\n", label ? label : "elapsed", elapsed);
+    if (iterations > 0) {
+        printf("        %.3f nsec per iteration\n", (elapsed * 1e9) / (double)iterations);
+    }
+}
+
 /* ======================= Core: member path resolution ======================= */
 
 static const VarType *vt_unwrap(const VarType *v)
@@ -941,6 +964,15 @@ void demo_pipeline(const char *func_name)
                compiled[k].expr_owned ? compiled[k].expr_owned : "<expr>",
                ok ? "TRUE" : "FALSE");
     }
+    
+    struct timespec time;
+    timer_start(&time);
+
+    for (int i = 0; i < 1000000; i++)
+        eval_compiled_trigger(&compiled[0], f, raw_args);
+
+    timer_end(&time, "1M compiled evals", 1000000);
+
 
     for (size_t i = 0; i < f->n_args; i++) free(dummy_blocks[i]);
     free(dummy_blocks);
