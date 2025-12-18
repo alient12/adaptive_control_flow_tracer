@@ -52,10 +52,7 @@ static void                *trace_events_base = NULL;
 static trace_cpu_buffer_t  *trace_cpu_buffers = NULL;
 static int                  trace_n_cpus      = 0;
 
-/* ------------------------- function signatures ------------------------- */
-FuncSig **func_sigs = NULL;  // array of FuncSig* for each traced function
-size_t    n_func_sigs = 0;   // number of functions in func_sigs
-
+static TriggerDB trigger_db;
 
 
 /* make &main safe to reference even if not exported */
@@ -104,13 +101,13 @@ static void print_libpatch_error(void);
 
 
 // static const uintptr_t func_rel_offs = 0x1195;  /* offset from main base to target site for probe1 */
-static const uintptr_t func_rel_offs = 0x1175;  /* offset from main base to target site for probe1 */
-// static const uintptr_t func_rel_offs = 0x2cf0;  /* offset from main base to target site for probe1 */
+// static const uintptr_t func_rel_offs = 0x1175;  /* offset from main base to target site for probe1 */
+static const uintptr_t func_rel_offs = 0x2cf0;  /* offset from main base to target site for probe1 */
 
 // Function start you want to scan for jumps (offset from main base)
 // IMPORTANT: set this to the *function entry* you want to instrument.
-// static const uintptr_t target_func_rel_offs = 0x2cf0;  // <-- change to your function's entry if needed
-static const uintptr_t target_func_rel_offs = 0x1175;  // <-- change to your function's entry if needed
+static const uintptr_t target_func_rel_offs = 0x2cf0;  // <-- change to your function's entry if needed
+// static const uintptr_t target_func_rel_offs = 0x1175;  // <-- change to your function's entry if needed
 // static const uintptr_t target_func_rel_offs = 0x1195;  // <-- change to your function's entry if needed
 // static const uintptr_t target_func_rel_offs = 0x122a;  // <-- change to your function's entry if needed
 static const size_t    target_func_max_bytes = 4096;   // how many bytes to scan
@@ -671,13 +668,28 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
     } else {
         probe1_t0 = rdtsc();
         int x = (int)ctx->general_purpose_registers[PATCH_X86_64_RDI];
+
         uint64_t *raw;
-        extract_raw_args_sysv_x86_64(ctx, NULL, raw);
+        const FuncSig *sig = trigger_db.entries[0].sig;
+        extract_raw_args_sysv_x86_64(ctx, sig, raw);
+
+        int result = eval_compiled_trigger(&trigger_db.entries[0].compiled, sig, raw);
+
+        //print raw args
+        printf("probe1: raw args: ");
+        for (size_t i = 0; i < sig->n_args; ++i) {
+            printf("%" PRIu64 " ", raw[i]);
+        }
+        printf("\n");
+        printf("eval trigger result: %d\n", result);
+        int value = *(int*)raw[0];
+        printf("extracted value: %d\n", value);
+
         // if (mode_probe2_enabled) {
         //     if (x >= 5 && x < 10) probe2_enable_all_global(); else probe2_disable_all_global();
         // }
 
-        probe2_enable_all_global();
+        // probe2_enable_all_global();
     }
     e = ctx->user_data; (*e)++;
 }
@@ -1012,6 +1024,8 @@ static void preload_init(void) {
     };
     ensure_patch(patch_init, options, array_size(options));
 
+    triggerdb_setup(&trigger_db, "config.yaml");
+
     if (mode_probe1_enabled) install_probe1();
     if (mode_probe2_enabled) { probe2_configure_all(); /* enabled on demand by probe1 */ }
 
@@ -1071,7 +1085,7 @@ uintptr_t base_address_for_pid(pid_t pid) {
 /* ------------------------- build hints ------------------------- */
 /*
 Compile:
-  gcc -g -fPIC -shared -o cft-auto-test.so cft-auto-test.c -ldl -lcapstone -lpatch
+  gcc -shared -fPIC cft-auto-data-test.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch
 Run:
-  LD_PRELOAD=$PWD/cft-auto-test.so ./example-program
+  LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
 */

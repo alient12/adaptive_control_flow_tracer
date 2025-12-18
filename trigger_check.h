@@ -19,6 +19,41 @@ extern "C" {
 
 int extract_raw_args_sysv_x86_64(const struct patch_exec_context *ctx, const FuncSig *f, uint64_t *out_raw_args); 
 
+/* ---------------- Trigger database ---------------- */
+typedef struct TriggerEntry {
+    /* identity */
+    size_t      index;         /* 0..n_entries-1 */
+    size_t      target_i;      /* cfg target index */
+    size_t      trigger_i;     /* trigger index within target */
+
+    /* target function */
+    char       *func_name;
+    uint64_t    func_lowpc;
+
+    /* trigger function (the function whose args are used in trigger expr) */
+    char       *trigger_func_name;
+    uint64_t    trigger_func_lowpc;
+
+    /* config */
+    int         recursive;
+
+    /* trigger */
+    char       *trigger_expr;
+    const FuncSig *sig;        /* owned by DwarfModel; valid while model lives */
+    CompiledTrigger compiled;  /* owned by this entry; must be freed */
+    int         compiled_ok;   /* 1 if compile_trigger succeeded */
+} TriggerEntry;
+
+typedef struct TriggerDB {
+    DwarfModel     *model;      /* owns FuncSig pointers */
+    TraceConditionCfg cfg;      /* we keep a copy alive (so t->func strings remain valid if you want) */
+
+    TriggerEntry   *entries;
+    size_t          n_entries;
+} TriggerDB;
+
+int triggerdb_setup(TriggerDB *db, const char *cfg_path);
+
 #ifdef __cplusplus
 }
 #endif

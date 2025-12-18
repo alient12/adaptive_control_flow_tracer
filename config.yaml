@@ -1,6 +1,13 @@
 TraceCondition:
   LogsDir: ./tracer_logs
   Targets:
+  - Func: price_out_impl
+    Recursive: false
+    TriggerFunc: price_out_impl
+    Triggers:
+      - arg0.feasible == 1836017711
+      # - arg0.nodes.orientation == 1
+      # - auto arg0 arg2
   - Func: update_tree
     Recursive: false
     TriggerFunc: update_tree

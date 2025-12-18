@@ -1334,59 +1334,61 @@ void dwarf_model_free(DwarfModel *m)
   If you want: keep model global, but DO NOT print automatically.
   You can call print_funcsig(&model->funcs[i]) wherever you want.
 */
-static DwarfModel *g_model = NULL;
+// static DwarfModel *g_model = NULL;
 
-__attribute__((constructor))
-static void on_load(void)
-{
-    /* Build cache + funcs once; no printing. */
-    g_model = dwarf_scan_collect_model();
+// __attribute__((constructor))
+// static void on_load(void)
+// {
+//     /* Build cache + funcs once; no printing. */
+//     g_model = dwarf_scan_collect_model();
 
-    dwarf_build_function_offset_table();
-    dwarf_update_function_offset_table_from_elf(/*include_plt=*/1);
+//     dwarf_build_function_offset_table();
+//     dwarf_update_function_offset_table_from_elf(/*include_plt=*/1);
 
-    // print offset table
-    // for (size_t i = 0; i < g_fotab.len; i++) {
-    //     printf("Function: %s -> low_pc: 0x%llx\n",
-    //            g_fotab.items[i].name,
-    //            (unsigned long long)g_fotab.items[i].lowpc);
-    // }
-}
+//     // print offset table
+//     for (size_t i = 0; i < g_fotab.len; i++) {
+//         printf("Function: %s -> low_pc: 0x%llx\n",
+//                g_fotab.items[i].name,
+//                (unsigned long long)g_fotab.items[i].lowpc);
+//     }
 
-__attribute__((destructor))
-static void on_unload(void)
-{
-    /* Free type/signature model */
-    dwarf_model_free(g_model);
-    g_model = NULL;
+//     print_function_by_name("price_out_impl");
+// }
 
-    /* Free function offset table (if built) */
-    fotab_free(&g_fotab);
-}
+// __attribute__((destructor))
+// static void on_unload(void)
+// {
+//     /* Free type/signature model */
+//     dwarf_model_free(g_model);
+//     g_model = NULL;
 
-/*
-  Helper you can call from your code when you want to print a specific function.
-  Example: call this from a debug hotkey, or from your probe config stage.
-*/
-void print_function_by_name(const char *name)
-{
-    if (!g_model || !name) return;
-    for (size_t i = 0; i < g_model->n_funcs; i++) {
-        if (g_model->funcs[i].name && strcmp(g_model->funcs[i].name, name) == 0) {
-            print_funcsig(&g_model->funcs[i]);
+//     /* Free function offset table (if built) */
+//     fotab_free(&g_fotab);
+// }
+
+// /*
+//   Helper you can call from your code when you want to print a specific function.
+//   Example: call this from a debug hotkey, or from your probe config stage.
+// */
+// void print_function_by_name(const char *name)
+// {
+//     if (!g_model || !name) return;
+//     for (size_t i = 0; i < g_model->n_funcs; i++) {
+//         if (g_model->funcs[i].name && strcmp(g_model->funcs[i].name, name) == 0) {
+//             print_funcsig(&g_model->funcs[i]);
             
-            // print function arguments types and struct members
-            DumpState st;
-            if (dumpstate_init(&st, 4096) == 0) {
-                for (size_t a = 0; a < g_model->funcs[i].n_args; a++) {
-                    dump_struct_members_state(g_model->funcs[i].args[a], 2, &st);
-                }
-                dumpstate_free(&st);
-            }
-            return;
-        }
-    }
-}
+//             // print function arguments types and struct members
+//             DumpState st;
+//             if (dumpstate_init(&st, 4096) == 0) {
+//                 for (size_t a = 0; a < g_model->funcs[i].n_args; a++) {
+//                     dump_struct_members_state(g_model->funcs[i].args[a], 2, &st);
+//                 }
+//                 dumpstate_free(&st);
+//             }
+//             return;
+//         }
+//     }
+// }
 
 
 // gcc -shared -fPIC libdwscan.c -o libdwscan.so -ldwarf -lz

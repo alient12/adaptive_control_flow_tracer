@@ -117,6 +117,130 @@ int extract_raw_args_sysv_x86_64(const struct patch_exec_context *ctx,
     return 0;
 }
 
+
+static char *tc_strdup_local(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char *p = (char*)malloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, s, n + 1);
+    return p;
+}
+
+static void triggerdb_free(TriggerDB *db)
+{
+    if (!db) return;
+
+    if (db->entries) {
+        for (size_t i = 0; i < db->n_entries; i++) {
+            TriggerEntry *e = &db->entries[i];
+            if (e->compiled_ok) compiled_trigger_free(&e->compiled);
+            free(e->func_name);
+            free(e->trigger_func_name);
+            free(e->trigger_expr);
+        }
+        free(db->entries);
+    }
+
+    /* cfg_free frees heap allocations inside cfg */
+    cfg_free(&db->cfg);
+
+    /* model owns FuncSig/VarType graphs */
+    dwarf_model_free(db->model);
+
+    memset(db, 0, sizeof(*db));
+}
+
+/* Build a flattened list of all triggers across all targets.
+   db->model + db->cfg stay alive so db->entries[i].sig remains valid. */
+int triggerdb_setup(TriggerDB *db, const char *cfg_path)
+{
+    if (!db) return -1;
+    memset(db, 0, sizeof(*db));
+
+    db->model = dwarf_scan_collect_model();
+    if (!db->model) {
+        printf("[error] failed to build DWARF model. make sure the target is compiled with debug info\n");
+        return -2;
+    }
+
+    if (!cfg_path) cfg_path = "config.yaml";
+    if (load_trace_config(cfg_path, &db->cfg) != 0) {
+        printf("failed to load %s\n", cfg_path);
+        dwarf_model_free(db->model);
+        db->model = NULL;
+        return -3;
+    }
+
+    /* Count total triggers */
+    size_t total = 0;
+    for (size_t i = 0; i < db->cfg.n_targets; i++) {
+        total += db->cfg.targets[i].triggers.n;
+    }
+
+    db->n_entries = total;
+    db->entries = (TriggerEntry*)calloc(total ? total : 1, sizeof(TriggerEntry));
+    if (!db->entries && total) {
+        triggerdb_free(db);
+        return -4;
+    }
+
+    /* Fill entries */
+    size_t idx = 0;
+    for (size_t ti = 0; ti < db->cfg.n_targets; ti++) {
+        const TargetCfg *t = &db->cfg.targets[ti];
+
+        uint64_t func_off = 0, trig_off = 0;
+        (void)dwarf_find_function_lowpc(t->func, &func_off);
+        (void)dwarf_find_function_lowpc(t->trigger_func, &trig_off);
+
+        const FuncSig *sig = find_funcsig_by_name(db->model, t->trigger_func);
+        if (!sig) {
+            printf("[warn] no FuncSig found for trigger function '%s'\n", t->trigger_func);
+        }
+
+        for (size_t k = 0; k < t->triggers.n; k++) {
+            TriggerEntry *e = &db->entries[idx];
+            memset(e, 0, sizeof(*e));
+
+            e->index      = idx;
+            e->target_i   = ti;
+            e->trigger_i  = k;
+
+            e->func_name  = tc_strdup_local(t->func);
+            e->func_lowpc = func_off;
+
+            e->trigger_func_name  = tc_strdup_local(t->trigger_func);
+            e->trigger_func_lowpc = trig_off;
+
+            e->recursive  = t->recursive;
+
+            e->trigger_expr = tc_strdup_local(t->triggers.items[k]);
+            e->sig = (const FuncSig *)sig;
+
+            if (sig) {
+                if (compile_trigger(&e->compiled, t->triggers.items[k], sig) == 0) {
+                    e->compiled_ok = 1;
+                } else {
+                    e->compiled_ok = 0;
+                    printf("[warn] failed to compile trigger[%zu] for %s: %s\n",
+                           k, t->trigger_func, t->triggers.items[k]);
+                }
+            }
+
+            idx++;
+        }
+    }
+
+    return 0;
+}
+
+static inline const TriggerEntry *triggerdb_get(const TriggerDB *db, size_t index)
+{
+    if (!db || !db->entries || index >= db->n_entries) return NULL;
+    return &db->entries[index];
+}
+
 void demo()
 {
     DwarfModel *model = dwarf_scan_collect_model();
@@ -174,17 +298,17 @@ void demo()
     dwarf_model_free(model);
 }
 
-__attribute__((constructor))
-static void on_load(void)
-{
-    demo();
-}
+// __attribute__((constructor))
+// static void on_load(void)
+// {
+//     demo();
+// }
 
-__attribute__((destructor))
-static void on_unload(void)
-{
+// __attribute__((destructor))
+// static void on_unload(void)
+// {
 
-}
+// }
 
 // gcc -shared -fPIC trigger_check.c trigger_compiler.c trace_config.c -o trigger_check.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml
 // LD_PRELOAD=./trigger_check.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64
