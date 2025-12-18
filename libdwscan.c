@@ -808,7 +808,7 @@ static int fotab_push(FuncOffTable *t, const char *name, uint64_t lowpc)
     return 0;
 }
 
-static void fotab_free(FuncOffTable *t)
+void fotab_free(FuncOffTable *t)
 {
     if (!t) return;
     for (size_t i = 0; i < t->len; i++) free(t->items[i].name);

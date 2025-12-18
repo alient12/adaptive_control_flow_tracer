@@ -25,10 +25,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 
-#include "trace_config.h"
-
-/* ======================= Shared model (from libdwscan) ======================= */
-#include "libdwscan.h"
+#include "trigger_compiler.h"
 
 /* ============================== Timing helpers =============================== */
 #include <time.h>
@@ -165,24 +162,6 @@ int read_u64(void *addr, uint64_t *out)
 
   This is already a big win vs parsing every call. Later we can switch to bytecode.
 */
-
-typedef enum {
-    VK_INT,
-    VK_FLOAT,
-    VK_STRING,
-    VK_BOOL,
-    VK_INVALID
-} ValueKind;
-
-typedef struct {
-    ValueKind kind;
-    union {
-        int64_t i;
-        double  f;
-        const char *s;
-        int b;
-    } v;
-} Value;
 
 static Value V_int(int64_t x)      { Value r={VK_INT};   r.v.i=x; return r; }
 static Value V_float(double x)    { Value r={VK_FLOAT}; r.v.f=x; return r; }
@@ -543,11 +522,6 @@ struct Node {
     } u;
 };
 
-typedef struct {
-    Node *root;
-    char *expr_owned;
-} CompiledTrigger;
-
 static void free_value_literal(Value v)
 {
     if (v.kind == VK_STRING) free((void*)v.v.s);
@@ -576,7 +550,7 @@ static void node_free(Node *n)
     free(n);
 }
 
-static void compiled_trigger_free(CompiledTrigger *t)
+void compiled_trigger_free(CompiledTrigger *t)
 {
     if (!t) return;
     node_free(t->root);
@@ -736,7 +710,7 @@ static Node *parse_ast_or(CParser *P)
 
 static Node *parse_ast_expr(CParser *P) { return parse_ast_or(P); }
 
-static int compile_trigger(CompiledTrigger *out, const char *expr, const FuncSig *sig)
+int compile_trigger(CompiledTrigger *out, const char *expr, const FuncSig *sig)
 {
     if (!out || !expr || !sig) return -1;
     memset(out, 0, sizeof(*out));
@@ -827,7 +801,7 @@ static Value eval_node(const Node *n, const FuncSig *sig, const uint64_t *raw_ar
     return V_invalid();
 }
 
-static int eval_compiled_trigger(const CompiledTrigger *t, const FuncSig *sig, const uint64_t *raw_args)
+int eval_compiled_trigger(const CompiledTrigger *t, const FuncSig *sig, const uint64_t *raw_args)
 {
     if (!t || !t->root || !sig || !raw_args) return 0;
     Value r = eval_node(t->root, sig, raw_args);
@@ -989,33 +963,33 @@ void demo_pipeline(const char *func_name)
 
 /* ======================= LD_PRELOAD Demo ======================= */
 
-static DwarfModel *model = NULL;
+// static DwarfModel *model = NULL;
 
-/* Runs when the .so is loaded */
-__attribute__((constructor))
-static void dwuser_on_load(void)
-{
-    fprintf(stderr, "[function] loaded via LD_PRELOAD\n");
+// /* Runs when the .so is loaded */
+// __attribute__((constructor))
+// static void dwuser_on_load(void)
+// {
+//     fprintf(stderr, "[function] loaded via LD_PRELOAD\n");
 
-    model = dwarf_scan_collect_model();
-    if (!model) {
-        fprintf(stderr, "[function] dwarf_scan_collect_model() failed\n");
-        return;
-    }
+//     model = dwarf_scan_collect_model();
+//     if (!model) {
+//         fprintf(stderr, "[function] dwarf_scan_collect_model() failed\n");
+//         return;
+//     }
 
-    /* Just as a demo: print one known function */
-    // print_function_by_name("update_tree");
-    demo_pipeline("update_tree");
-}
+//     /* Just as a demo: print one known function */
+//     // print_function_by_name("update_tree");
+//     demo_pipeline("update_tree");
+// }
 
-/* Runs when the program exits */
-__attribute__((destructor))
-static void dwuser_on_unload(void)
-{
-    fprintf(stderr, "[function] unloading\n");
-    dwarf_model_free(model);
-    model = NULL;
-}
+// /* Runs when the program exits */
+// __attribute__((destructor))
+// static void dwuser_on_unload(void)
+// {
+//     fprintf(stderr, "[function] unloading\n");
+//     dwarf_model_free(model);
+//     model = NULL;
+// }
 
 
 // gcc -shared -fPIC trigger_compiler.c trace_config.c -o trigger_compiler.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml

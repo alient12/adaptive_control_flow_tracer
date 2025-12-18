@@ -182,6 +182,29 @@ void dump_struct_members(const VarType *v, int indent);
  */
 void print_function_by_name(const char *name);
 
+/*
+ * Build the function offset table: function name -> DW_AT_low_pc.
+ *
+ * Returns 0 on success, negative on failure.
+ */
+int dwarf_build_function_offset_table(void);
+
+/*
+ * Lookup function low_pc by name.
+ *
+ * Parameters:
+ *   func_name: function name to look up
+ *   out_lowpc: output pointer for DW_AT_low_pc value
+ *
+ * Returns 1 if found and out_lowpc is set, 0 if not found or on error.
+ */
+int dwarf_find_function_lowpc(const char *func_name, uint64_t *out_lowpc);
+
+/*
+ * Free function offset table resources.
+ */
+void fotab_free(FuncOffTable *t);
+
 #ifdef __cplusplus
 }
 #endif
