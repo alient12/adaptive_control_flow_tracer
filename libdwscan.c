@@ -768,6 +768,524 @@ void dump_struct_members(const VarType *v, int indent)
     dumpstate_free(&st);
 }
 
+/* ------------------------------ Function offset table ------------------------------ */
+
+/*
+ * Builds a compact table: function name -> DW_AT_low_pc (address/offset).
+ *
+ * Notes / caveats:
+ * - We record DW_AT_low_pc when present. If a subprogram has no low_pc (e.g.,
+ *   only DW_AT_ranges), we currently skip it.
+ * - The recorded value is whatever DWARF reports (often a link-time address or
+ *   a text-section-relative offset for PIE/ET_DYN). If you need runtime address,
+ *   you may need to add the load base.
+ * - This is intentionally independent of DwarfModel so we don't have to touch
+ *   existing structs/APIs.
+ */
+
+static FuncOffTable g_fotab = {0};
+
+static int fotab_grow(FuncOffTable *t, size_t need)
+{
+    if (t->cap >= need) return 0;
+    size_t nc = t->cap ? t->cap * 2 : 256;
+    while (nc < need) nc *= 2;
+    void *p = xrealloc(t->items, nc * sizeof(*t->items));
+    if (!p) return -1;
+    t->items = (FuncOffEntry*)p;
+    t->cap = nc;
+    return 0;
+}
+
+static int fotab_push(FuncOffTable *t, const char *name, uint64_t lowpc)
+{
+    if (!name || !*name) return 0;
+    if (fotab_grow(t, t->len + 1) != 0) return -1;
+    t->items[t->len].name = xstrdup(name);
+    t->items[t->len].lowpc = lowpc;
+    if (!t->items[t->len].name) return -1;
+    t->len++;
+    return 0;
+}
+
+static void fotab_free(FuncOffTable *t)
+{
+    if (!t) return;
+    for (size_t i = 0; i < t->len; i++) free(t->items[i].name);
+    free(t->items);
+    t->items = NULL;
+    t->len = 0;
+    t->cap = 0;
+}
+
+static int die_lowpc_u64(Dwarf_Die subp_die, uint64_t *out_lowpc, Dwarf_Error *err)
+{
+    if (!out_lowpc) return DW_DLV_ERROR;
+
+    /* Prefer dwarf_lowpc_b if available in your libdwarf; fallback to attr parsing. */
+#if defined(DW_DLV_OK)
+    {
+        Dwarf_Addr a = 0;
+        int rc = dwarf_lowpc(subp_die, &a, err);
+        if (rc == DW_DLV_OK) { *out_lowpc = (uint64_t)a; return DW_DLV_OK; }
+    }
+#endif
+
+    Dwarf_Attribute at = 0;
+    if (dwarf_attr(subp_die, DW_AT_low_pc, &at, err) != DW_DLV_OK) return DW_DLV_NO_ENTRY;
+
+    Dwarf_Addr a = 0;
+    if (dwarf_formaddr(at, &a, err) != DW_DLV_OK) return DW_DLV_ERROR;
+
+    *out_lowpc = (uint64_t)a;
+    return DW_DLV_OK;
+}
+
+static void walk_die_tree_collect_offsets(Dwarf_Die die, FuncOffTable *out, Dwarf_Error *err)
+{
+    if (!die) return;
+
+    Dwarf_Half tag = 0;
+    if (dwarf_tag(die, &tag, err) == DW_DLV_OK && tag == DW_TAG_subprogram) {
+        char *nm = NULL;
+        if (dwarf_diename(die, &nm, err) == DW_DLV_OK && nm && nm[0]) {
+            uint64_t lowpc = 0;
+            if (die_lowpc_u64(die, &lowpc, err) == DW_DLV_OK) {
+                (void)fotab_push(out, nm, lowpc);
+            }
+        }
+    }
+
+    Dwarf_Die child = 0;
+    if (dwarf_child(die, &child, err) == DW_DLV_OK) {
+        walk_die_tree_collect_offsets(child, out, err);
+    }
+
+    Dwarf_Die sib = 0;
+    int rc = dwarf_siblingof_c(die, &sib, err);
+    dwarf_dealloc_die(die);
+    if (rc == DW_DLV_OK) {
+        walk_die_tree_collect_offsets(sib, out, err);
+    }
+}
+
+/*
+ * Public-ish entrypoint (no header change here): builds g_fotab once.
+ * Returns 0 on success, negative on failure.
+ */
+int dwarf_build_function_offset_table(void)
+{
+    if (g_fotab.items && g_fotab.len) return 0; /* already built */
+
+    int fd = open("/proc/self/exe", O_RDONLY);
+    if (fd < 0) return -1;
+
+    Dwarf_Debug dbg = 0;
+    Dwarf_Error err = 0;
+
+    if (dwarf_init_b(fd, DW_GROUPNUMBER_ANY, NULL, NULL, &dbg, &err) != DW_DLV_OK) {
+        close(fd);
+        return -1;
+    }
+
+    for (;;) {
+        Dwarf_Die cu_die = 0;
+        Dwarf_Unsigned cu_header_length = 0;
+        Dwarf_Half version_stamp = 0;
+        Dwarf_Off abbrev_offset = 0;
+        Dwarf_Half address_size = 0;
+        Dwarf_Half length_size = 0;
+        Dwarf_Half extension_size = 0;
+        Dwarf_Sig8 type_signature;
+        Dwarf_Unsigned typeoffset = 0;
+        Dwarf_Unsigned next_cu_header_offset = 0;
+        Dwarf_Half header_cu_type = 0;
+
+        int rc = dwarf_next_cu_header_e(
+            dbg,
+            /*dw_is_info=*/1,
+            &cu_die,
+            &cu_header_length,
+            &version_stamp,
+            &abbrev_offset,
+            &address_size,
+            &length_size,
+            &extension_size,
+            &type_signature,
+            &typeoffset,
+            &next_cu_header_offset,
+            &header_cu_type,
+            &err);
+
+        if (rc == DW_DLV_NO_ENTRY) break;
+        if (rc != DW_DLV_OK) break;
+
+        walk_die_tree_collect_offsets(cu_die, &g_fotab, &err);
+    }
+
+    dwarf_finish(dbg);
+    close(fd);
+
+    return 0;
+}
+
+/* Lookup helper (returns 1 if found, 0 otherwise). */
+int dwarf_find_function_lowpc(const char *func_name, uint64_t *out_lowpc)
+{
+    if (!func_name || !*func_name || !out_lowpc) return 0;
+    if (dwarf_build_function_offset_table() != 0) return 0;
+
+    for (size_t i = 0; i < g_fotab.len; i++) {
+        if (g_fotab.items[i].name && strcmp(g_fotab.items[i].name, func_name) == 0) {
+            *out_lowpc = g_fotab.items[i].lowpc;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------ ELF symbol table (augment offset table) ------------------------------ */
+
+/*
+ * Augment g_fotab using ELF symbol tables (.symtab/.dynsym). This captures
+ * linker/runtime symbols which are not represented in DWARF, such as:
+ *   - _start, _init, _fini
+ *   - puts@plt, memcpy@plt (when present in .symtab)
+ *   - many shared-library related symbols (from .dynsym)
+ *
+ * This does NOT change the existing DWARF collector; it simply adds extra
+ * name->address mappings into the same g_fotab table.
+ *
+ * Limitations (by design for simplicity):
+ * - 64-bit ELF only (ELFCLASS64)
+ * - little-endian only (ELFDATA2LSB)
+ */
+
+static ssize_t pread_full(int fd, void *buf, size_t n, off_t off)
+{
+    size_t got = 0;
+    while (got < n) {
+        ssize_t rc = pread(fd, (char*)buf + got, n - got, off + (off_t)got);
+        if (rc == 0) break;
+        if (rc < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        got += (size_t)rc;
+    }
+    return (ssize_t)got;
+}
+
+static int fotab_find_index(const FuncOffTable *t, const char *name)
+{
+    if (!t || !name) return -1;
+    for (size_t i = 0; i < t->len; i++) {
+        if (t->items[i].name && strcmp(t->items[i].name, name) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static int fotab_upsert(FuncOffTable *t, const char *name, uint64_t addr)
+{
+    if (!t || !name || !*name) return 0;
+    int idx = fotab_find_index(t, name);
+    if (idx >= 0) {
+        /* Keep the original DWARF lowpc if present; otherwise fill it in. */
+        if (t->items[idx].lowpc == 0 && addr != 0) t->items[idx].lowpc = addr;
+        return 0;
+    }
+    return fotab_push(t, name, addr);
+}
+
+static int sym_is_interesting(const char *nm, uint8_t st_type, const char *secname, int include_plt)
+{
+    if (!nm || !*nm) return 0;
+
+    /* Most "function-like" symbols */
+    if (st_type == STT_FUNC) return 1;
+
+    /* Some toolchains mark PLT stubs as NOTYPE; allow if explicitly requested. */
+    if (include_plt) {
+        if (strstr(nm, "@plt") != NULL) return 1;
+        if (secname && (strncmp(secname, ".plt", 4) == 0)) return 1;
+    }
+
+    /* _start sometimes shows as STT_FUNC, but keep a name-based fallback anyway. */
+    if (strcmp(nm, "_start") == 0 || strcmp(nm, "_init") == 0 || strcmp(nm, "_fini") == 0) return 1;
+
+    return 0;
+}
+
+static int elf_add_plt_stubs_from_relocs(int fd,
+                                         FuncOffTable *t,
+                                         int include_plt,
+                                         const Elf64_Shdr *shdrs,
+                                         size_t shnum,
+                                         const char *shstr,
+                                         size_t shstr_sz)
+{
+    if (!include_plt) return 0;
+    if (!t || !shdrs || shnum == 0) return 0;
+
+    /* Find a PLT section (prefer .plt.sec if present, else .plt). */
+    int plt_sec = -1;
+    int plt_is_sec = 0;
+    for (size_t i = 0; i < shnum; i++) {
+        const char *sn = NULL;
+        if (shstr && shdrs[i].sh_name < shstr_sz) sn = shstr + shdrs[i].sh_name;
+        if (!sn) continue;
+        if (strcmp(sn, ".plt.sec") == 0) { plt_sec = (int)i; plt_is_sec = 1; break; }
+        if (plt_sec < 0 && strcmp(sn, ".plt") == 0) { plt_sec = (int)i; plt_is_sec = 0; }
+    }
+    if (plt_sec < 0) return 0;
+
+    uint64_t plt_base = (uint64_t)shdrs[plt_sec].sh_addr;
+    size_t plt_entsz = (size_t)shdrs[plt_sec].sh_entsize;
+    if (plt_entsz == 0) plt_entsz = 16; /* x86_64 default */
+    size_t plt_hdr = plt_is_sec ? 0 : plt_entsz; /* .plt has a resolver entry at index 0 */
+
+    int added = 0;
+
+    /* Look for relocation sections typically associated with PLT. */
+    for (size_t ri = 0; ri < shnum; ri++) {
+        const Elf64_Shdr relh = shdrs[ri];
+        const char *rn = NULL;
+        if (shstr && relh.sh_name < shstr_sz) rn = shstr + relh.sh_name;
+        if (!rn) continue;
+
+        int is_plt_reloc = 0;
+        if (strcmp(rn, ".rela.plt") == 0 || strcmp(rn, ".rel.plt") == 0 ||
+            strcmp(rn, ".rela.plt.sec") == 0 || strcmp(rn, ".rel.plt.sec") == 0) {
+            is_plt_reloc = 1;
+        }
+        if (!is_plt_reloc) continue;
+
+        /* Relocations link to a symbol table (usually .dynsym). */
+        if (relh.sh_link == SHN_UNDEF || relh.sh_link >= shnum) continue;
+        const Elf64_Shdr symh = shdrs[relh.sh_link];
+        if (symh.sh_entsize != sizeof(Elf64_Sym) || symh.sh_size < sizeof(Elf64_Sym)) continue;
+        if (symh.sh_link == SHN_UNDEF || symh.sh_link >= shnum) continue;
+
+        const Elf64_Shdr strh = shdrs[symh.sh_link];
+        size_t strsz = (size_t)strh.sh_size;
+        char *strtab = (char*)malloc(strsz ? strsz : 1);
+        if (!strtab) continue;
+        if (strsz && pread_full(fd, strtab, strsz, (off_t)strh.sh_offset) != (ssize_t)strsz) {
+            free(strtab);
+            continue;
+        }
+
+        size_t nsyms = (size_t)(symh.sh_size / sizeof(Elf64_Sym));
+        Elf64_Sym *syms = (Elf64_Sym*)malloc(nsyms * sizeof(Elf64_Sym));
+        if (!syms) {
+            free(strtab);
+            continue;
+        }
+        if (pread_full(fd, syms, nsyms * sizeof(Elf64_Sym), (off_t)symh.sh_offset) != (ssize_t)(nsyms * sizeof(Elf64_Sym))) {
+            free(syms);
+            free(strtab);
+            continue;
+        }
+
+        /* Read relocations */
+        size_t nrels = 0;
+        if (relh.sh_type == SHT_RELA && relh.sh_entsize == sizeof(Elf64_Rela)) {
+            nrels = (size_t)(relh.sh_size / sizeof(Elf64_Rela));
+            Elf64_Rela *rels = (Elf64_Rela*)malloc(nrels * sizeof(Elf64_Rela));
+            if (!rels) { free(syms); free(strtab); continue; }
+            if (pread_full(fd, rels, nrels * sizeof(Elf64_Rela), (off_t)relh.sh_offset) != (ssize_t)(nrels * sizeof(Elf64_Rela))) {
+                free(rels); free(syms); free(strtab); continue;
+            }
+
+            for (size_t i = 0; i < nrels; i++) {
+                uint32_t symidx = (uint32_t)ELF64_R_SYM(rels[i].r_info);
+                if (symidx >= nsyms) continue;
+                if (syms[symidx].st_name == 0 || syms[symidx].st_name >= strsz) continue;
+                const char *nm = strtab + syms[symidx].st_name;
+                if (!nm || !*nm) continue;
+
+                uint64_t stub = plt_base + (uint64_t)plt_hdr + (uint64_t)i * (uint64_t)plt_entsz;
+                char buf[512];
+                snprintf(buf, sizeof(buf), "%s@plt", nm);
+                int before = (int)t->len;
+                (void)fotab_upsert(t, buf, stub);
+                if ((int)t->len > before) added++;
+            }
+
+            free(rels);
+        } else if (relh.sh_type == SHT_REL && relh.sh_entsize == sizeof(Elf64_Rel)) {
+            nrels = (size_t)(relh.sh_size / sizeof(Elf64_Rel));
+            Elf64_Rel *rels = (Elf64_Rel*)malloc(nrels * sizeof(Elf64_Rel));
+            if (!rels) { free(syms); free(strtab); continue; }
+            if (pread_full(fd, rels, nrels * sizeof(Elf64_Rel), (off_t)relh.sh_offset) != (ssize_t)(nrels * sizeof(Elf64_Rel))) {
+                free(rels); free(syms); free(strtab); continue;
+            }
+
+            for (size_t i = 0; i < nrels; i++) {
+                uint32_t symidx = (uint32_t)ELF64_R_SYM(rels[i].r_info);
+                if (symidx >= nsyms) continue;
+                if (syms[symidx].st_name == 0 || syms[symidx].st_name >= strsz) continue;
+                const char *nm = strtab + syms[symidx].st_name;
+                if (!nm || !*nm) continue;
+
+                uint64_t stub = plt_base + (uint64_t)plt_hdr + (uint64_t)i * (uint64_t)plt_entsz;
+                char buf[512];
+                snprintf(buf, sizeof(buf), "%s@plt", nm);
+                int before = (int)t->len;
+                (void)fotab_upsert(t, buf, stub);
+                if ((int)t->len > before) added++;
+            }
+
+            free(rels);
+        }
+
+        free(syms);
+        free(strtab);
+    }
+
+    return added;
+}
+
+static int elf_augment_fotab_from_fd(int fd, FuncOffTable *t, int include_plt)
+{
+    if (!t) return -1;
+
+    Elf64_Ehdr eh;
+    if (pread_full(fd, &eh, sizeof(eh), 0) != (ssize_t)sizeof(eh)) return -1;
+
+    if (memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0) return -1;
+    if (eh.e_ident[EI_CLASS] != ELFCLASS64) return -1;
+    if (eh.e_ident[EI_DATA] != ELFDATA2LSB) return -1;
+
+    if (eh.e_shoff == 0 || eh.e_shentsize != sizeof(Elf64_Shdr) || eh.e_shnum == 0) return -1;
+
+    /* Read all section headers */
+    size_t shdrs_sz = (size_t)eh.e_shnum * sizeof(Elf64_Shdr);
+    Elf64_Shdr *shdrs = (Elf64_Shdr*)malloc(shdrs_sz);
+    if (!shdrs) return -1;
+
+    if (pread_full(fd, shdrs, shdrs_sz, (off_t)eh.e_shoff) != (ssize_t)shdrs_sz) {
+        free(shdrs);
+        return -1;
+    }
+
+    /* Read section-header string table (for section names) */
+    char *shstr = NULL;
+    size_t shstr_sz = 0;
+    if (eh.e_shstrndx != SHN_UNDEF && eh.e_shstrndx < eh.e_shnum) {
+        Elf64_Shdr shstrh = shdrs[eh.e_shstrndx];
+        shstr_sz = (size_t)shstrh.sh_size;
+        shstr = (char*)malloc(shstr_sz ? shstr_sz : 1);
+        if (shstr && shstr_sz) {
+            if (pread_full(fd, shstr, shstr_sz, (off_t)shstrh.sh_offset) != (ssize_t)shstr_sz) {
+                free(shstr);
+                shstr = NULL;
+                shstr_sz = 0;
+            }
+        }
+    }
+
+    int added = 0;
+
+    /* Iterate symtab + dynsym */
+    for (size_t si = 0; si < eh.e_shnum; si++) {
+        Elf64_Shdr symh = shdrs[si];
+        if (symh.sh_type != SHT_SYMTAB && symh.sh_type != SHT_DYNSYM) continue;
+        if (symh.sh_entsize != sizeof(Elf64_Sym) || symh.sh_size < sizeof(Elf64_Sym)) continue;
+        if (symh.sh_link == SHN_UNDEF || symh.sh_link >= eh.e_shnum) continue;
+
+        /* Read the linked string table for symbol names */
+        Elf64_Shdr strh = shdrs[symh.sh_link];
+        size_t strsz = (size_t)strh.sh_size;
+        char *strtab = (char*)malloc(strsz ? strsz : 1);
+        if (!strtab) continue;
+        if (strsz && pread_full(fd, strtab, strsz, (off_t)strh.sh_offset) != (ssize_t)strsz) {
+            free(strtab);
+            continue;
+        }
+
+        /* Read symbols */
+        size_t nsyms = (size_t)(symh.sh_size / sizeof(Elf64_Sym));
+        Elf64_Sym *syms = (Elf64_Sym*)malloc(nsyms * sizeof(Elf64_Sym));
+        if (!syms) {
+            free(strtab);
+            continue;
+        }
+        if (pread_full(fd, syms, nsyms * sizeof(Elf64_Sym), (off_t)symh.sh_offset) != (ssize_t)(nsyms * sizeof(Elf64_Sym))) {
+            free(syms);
+            free(strtab);
+            continue;
+        }
+
+        for (size_t i = 0; i < nsyms; i++) {
+            Elf64_Sym s = syms[i];
+            if (s.st_name == 0 || s.st_name >= strsz) continue;
+            const char *nm = strtab + s.st_name;
+            if (!nm || !*nm) continue;
+
+            uint8_t st_type = ELF64_ST_TYPE(s.st_info);
+
+            const char *secname = NULL;
+            if (shstr && s.st_shndx != SHN_UNDEF && s.st_shndx < eh.e_shnum) {
+                uint32_t noff = shdrs[s.st_shndx].sh_name;
+                if (noff < shstr_sz) secname = shstr + noff;
+            }
+
+            if (!sym_is_interesting(nm, st_type, secname, include_plt)) continue;
+
+            /* st_value is the symbol address (or 0 for undefined/imported) */
+            if (s.st_value == 0) {
+                /* Allow adding undefined dynsym entries if you want later, but skip for now */
+                continue;
+            }
+
+            int before = (int)t->len;
+            if (fotab_upsert(t, nm, (uint64_t)s.st_value) != 0) {
+                /* ignore OOM errors for now */
+                continue;
+            }
+            if ((int)t->len > before) added++;
+        }
+
+        free(syms);
+        free(strtab);
+    }
+    /* If requested, synthesize @plt stubs from relocation sections (common case). */
+    if (include_plt) {
+        int plt_added = elf_add_plt_stubs_from_relocs(fd, t, include_plt, shdrs, (size_t)eh.e_shnum, shstr, shstr_sz);
+        if (plt_added > 0) added += plt_added;
+    }
+
+    free(shstr);
+    free(shdrs);
+
+    return added;
+}
+
+/*
+ * Public function: augment the existing DWARF-based table with ELF symbols.
+ *
+ * include_plt:
+ *   - 0: only regular function symbols (_start/_init/_fini included)
+ *   - 1: also include PLT-style stubs when found (puts@plt, memcpy@plt, ...)
+ *
+ * Returns: number of new entries added (>=0), or negative on error.
+ */
+int dwarf_update_function_offset_table_from_elf(int include_plt)
+{
+    /* Ensure DWARF table exists first (so ELF can "fill gaps" without overwriting). */
+    if (dwarf_build_function_offset_table() != 0) {
+        /* Even if DWARF failed, still try ELF; keep behavior simple */
+    }
+
+    int fd = open("/proc/self/exe", O_RDONLY);
+    if (fd < 0) return -1;
+
+    int added = elf_augment_fotab_from_fd(fd, &g_fotab, include_plt);
+    close(fd);
+    return added;
+}
+
 /* ------------------------------ Freeing ------------------------------ */
 
 static void free_vartype_shallow(VarType *v)
@@ -823,13 +1341,27 @@ static void on_load(void)
 {
     /* Build cache + funcs once; no printing. */
     g_model = dwarf_scan_collect_model();
+
+    dwarf_build_function_offset_table();
+    dwarf_update_function_offset_table_from_elf(/*include_plt=*/1);
+
+    // print offset table
+    // for (size_t i = 0; i < g_fotab.len; i++) {
+    //     printf("Function: %s -> low_pc: 0x%llx\n",
+    //            g_fotab.items[i].name,
+    //            (unsigned long long)g_fotab.items[i].lowpc);
+    // }
 }
 
 __attribute__((destructor))
 static void on_unload(void)
 {
+    /* Free type/signature model */
     dwarf_model_free(g_model);
     g_model = NULL;
+
+    /* Free function offset table (if built) */
+    fotab_free(&g_fotab);
 }
 
 /*

@@ -20,9 +20,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #include <libdwarf/libdwarf.h>
 #include <libdwarf/dwarf.h>
+
+#include <elf.h>
+#include <errno.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -127,6 +131,19 @@ typedef struct {
     size_t printed_len;
     size_t printed_cap;
 } DumpState;
+
+/* ============================ Function Offset Table ============================ */
+
+typedef struct {
+    char *name;        /* function name (owned by table) */
+    uint64_t lowpc;    /* DW_AT_low_pc as reported by DWARF */
+} FuncOffEntry;
+
+typedef struct {
+    FuncOffEntry *items;
+    size_t len;
+    size_t cap;
+} FuncOffTable;
 
 /* ============================ Public API ============================ */
 
