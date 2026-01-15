@@ -89,8 +89,8 @@ void probe2_set_disable_all(Probe2Set *set);
 
 /* ------------------------- config & globals ------------------------- */
 
-bool mode_probe1_enabled = true;
-bool mode_probe2_enabled = true;
+bool mode_probe1_enabled = false;
+bool mode_probe2_enabled = false;
 
 static uintptr_t program_base(void); // early fwd so we can use it above
 
@@ -720,19 +720,15 @@ typedef struct {
 static ProbeTimeStats g_probe_time_stats = {0};
 static __thread uint64_t probe_time_t0 = 0;
 
-/* record start time */
-static void probe_time_start(struct patch_exec_context *ctx, uint8_t post) {
+/* record function time */
+static void probe_time(struct patch_exec_context *ctx, uint8_t post) {
     if (!post) {
         probe_time_t0 = rdtsc();
-    }
-}
-
-/* record end time (at function return) */
-static void probe_time_end(struct patch_exec_context *ctx, uint8_t post) {
-    if (post) {
+    } else {
         uint64_t d = rdtsc() - probe_time_t0;
         atomic_fetch_add_explicit(&g_probe_time_stats.total_cycles, d, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_probe_time_stats.calls, 1, memory_order_relaxed);
+        printf("probe_time: function took %llu cycles\n", (unsigned long long)d);
     }
 }
 
@@ -747,107 +743,32 @@ static void install_probe_time(void *func_addr, size_t max_bytes) {
 
     printf("[probe_time] Installing timing probes at %p\n", func_addr);
 
-    /* disassemble and find all RETs */
-    csh handle;
-    cs_insn *insn = NULL;
-    cs_err err = cs_open(CS_ARCH_X86, CS_MODE_64, &handle);
-    if (err != CS_ERR_OK) {
-        fprintf(stderr, "[probe_time] capstone open failed\n");
-        return;
-    }
-    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
-
-    const uint8_t *code = (const uint8_t*)func_addr;
-    size_t count = cs_disasm(handle, code, max_bytes, (uint64_t)(uintptr_t)func_addr, 0, &insn);
-    if (count == 0) {
-        fprintf(stderr, "[probe_time] disasm failed\n");
-        cs_close(&handle);
-        return;
-    }
-
-    uintptr_t next = x86_nth_next_addr((const void*)func_addr, 0);
-    if (!next) {
-        fprintf(stderr, "[probe-time] unsupported encoding after address=%p\n", func_addr);
-        return;
-    }
-    fprintf(stderr, "[probe-time] next address=%p\n", (const void*)next);
-
-    /* install probe_time_start at function entry */
+    /* install probe_time at function entry and exit */
     {
         struct patch_location location = {
             .type        = PATCH_LOCATION_RANGE,
             .direction   = PATCH_LOCATION_FORWARD,
             .algorithm   = PATCH_LOCATION_FIRST,
-            .range.lower = next,
+            // .range.lower = next,
+            .range.lower = (uintptr_t)func_addr,
             .range.upper = 0,
         };
         struct patch_exec_model model = {
-            .type = PATCH_EXEC_MODEL_PROBE_AROUND,
+            .type = PATCH_EXEC_MODEL_PROBE_RETURN,
             .probe.read_registers    = 0,
             .probe.write_registers   = 0,
             .probe.clobber_registers = PATCH_REGS_ALL,
             .probe.user_data         = NULL,
-            .probe.procedure         = &probe_time_start,
+            .probe.procedure         = &probe_time,
         };
         patch_t p;
         ensure_patch(patch_make, &location, &model, NULL, &p, NULL);
         ensure_patch(patch_enable, p);
     }
 
-    /* install probe_time_end at every RET */
-    size_t rets = 0;
-    for (size_t i = 0; i < count; ++i) {
-        // If we hit an instruction indicating a new function, stop scanning
-        if (i != 0)
-        {
-            if (insn[i].id == X86_INS_ENDBR64 || insn[i].id == X86_INS_ENDBR32 /* || add more checks if needed */) {
-                fprintf(stderr, "[probe-time] Reached start of a new function at %p, stopping probe installation\n",
-                        (void*)insn[i].address);
-                break;
-            }
-        }
-        if (insn[i].id == X86_INS_RET || insn[i].id == X86_INS_RETF) {
-            // Install probe on the 3rd instruction before the RET
-            uintptr_t ret_addr = (uintptr_t)insn[i].address;
-
-            if (i <= 2) {
-                fprintf(stderr, "[probe-time] RET at %p is too close to function start; cannot install probe 3 instructions before\n", (void*)ret_addr);
-                continue;
-            }
-
-            uintptr_t prev_insn_addr = (uintptr_t)insn[i - 3].address;
-            printf("[probe-time] Installing probe at 3rd instruction before RET: %p\n", (void*)prev_insn_addr);
-
-            struct patch_location location = {
-                .type        = PATCH_LOCATION_RANGE,
-                .direction   = PATCH_LOCATION_FORWARD,
-                .algorithm   = PATCH_LOCATION_FIRST,
-                .range.lower = prev_insn_addr,
-                .range.upper = 0,
-            };
-
-            struct patch_exec_model model = {
-                .type = PATCH_EXEC_MODEL_PROBE_AROUND,
-                .probe.read_registers    = 0,
-                .probe.write_registers   = 0,
-                .probe.clobber_registers = PATCH_REGS_ALL,
-                .probe.user_data         = NULL,
-                .probe.procedure         = &probe_time_end,
-            };
-
-            patch_t p;
-            ensure_patch(patch_make, &location, &model, NULL, &p, NULL);
-            ensure_patch(patch_enable, p);
-            rets++;
-        }
-    }
-
-
-    cs_free(insn, count);
-    cs_close(&handle);
     ensure_patch(patch_commit);
 
-    printf("[probe_time] Installed start probe + %zu end probes\n", rets);
+    printf("[probe_time] Installed function time probe\n");
 }
 
 /* report collected timing results */
@@ -1085,7 +1006,7 @@ uintptr_t base_address_for_pid(pid_t pid) {
 /* ------------------------- build hints ------------------------- */
 /*
 Compile:
-  gcc -shared -fPIC cft-auto-data-test.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch
+  gcc -shared -fPIC cft-auto-data-test.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch -lolx
 Run:
   LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
 */
