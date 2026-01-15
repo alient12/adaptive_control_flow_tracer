@@ -54,6 +54,15 @@ static int                  trace_n_cpus      = 0;
 
 static TriggerDB trigger_db;
 
+/* ------------------------- probe time vars ------------------------- */
+typedef struct {
+    _Atomic uint64_t calls;
+    _Atomic uint64_t total_cycles;
+} ProbeTimeStats;
+
+static ProbeTimeStats g_probe_time_stats = {0};
+static __thread uint64_t probe_time_t0 = 0;
+
 
 /* make &main safe to reference even if not exported */
 extern int main(int, char **, char **) __attribute__((weak));
@@ -89,14 +98,14 @@ void probe2_set_disable_all(Probe2Set *set);
 
 /* ------------------------- config & globals ------------------------- */
 
-bool mode_probe1_enabled = false;
+bool mode_probe1_enabled = true;
 bool mode_probe2_enabled = false;
 
 static uintptr_t program_base(void); // early fwd so we can use it above
 
 static void probe1(struct patch_exec_context *ctx, uint8_t ret);
 static void probe2(struct patch_exec_context *ctx, uint8_t ret);
-static void install_probe1(void);
+static void install_probe1(void *func_addr);
 static void print_libpatch_error(void);
 
 
@@ -619,15 +628,13 @@ static void probe2_disable_all_global(void) {
 }
 
 
-static void install_probe1(void) {
-    uintptr_t base = program_base();
-    fprintf(stderr, "Main base: 0x%" PRIxPTR "\n", base);
-
-    uintptr_t abs_addr = base + func_rel_offs;
-    if (!abs_addr) {
-        fprintf(stderr, "[probe1] invalid abs_addr (rel_off=0x%" PRIxPTR ")\n", func_rel_offs);
+static void install_probe1(void *func_addr) {
+    if (!func_addr) {
+        fprintf(stderr, "[probe1] invalid func_addr\n");
         return;
     }
+
+    printf("[probe1] Installing probe1 at %p\n", func_addr);
 
     const struct patch_option options[] = {
         { .type = PATCH_OPT_ENABLE_WXE, .enable_wxe = 0 },
@@ -637,12 +644,12 @@ static void install_probe1(void) {
         .type        = PATCH_LOCATION_RANGE,
         .direction   = PATCH_LOCATION_FORWARD,
         .algorithm   = PATCH_LOCATION_FIRST,
-        .range.lower = abs_addr,
+        .range.lower = (uintptr_t)func_addr,
         .range.upper = 0,
     };
 
     struct patch_exec_model exec_model = {
-        .type                    = PATCH_EXEC_MODEL_PROBE_AROUND,
+        .type                    = PATCH_EXEC_MODEL_PROBE_RETURN,
         .probe.read_registers    = 0,
         .probe.write_registers   = 0,
         .probe.clobber_registers = PATCH_REGS_ALL,
@@ -659,13 +666,8 @@ static void install_probe1(void) {
 /* ------------------------- probes ------------------------- */
 
 static void probe1(struct patch_exec_context *ctx, uint8_t post) {
-    int *e;
-    if (post) {
-        uint64_t d = rdtsc() - probe1_t0;
-        atomic_fetch_add_explicit(&probe1_cycles, d, memory_order_relaxed);
-        atomic_fetch_add_explicit(&probe1_calls, 1, memory_order_relaxed);
-        // printf("probe1 triggered\n");
-    } else {
+    if (!post) {
+        /*************************************** probe 1 code **************************************/
         probe1_t0 = rdtsc();
         int x = (int)ctx->general_purpose_registers[PATCH_X86_64_RDI];
 
@@ -690,8 +692,19 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         // }
 
         // probe2_enable_all_global();
+
+        uint64_t d = rdtsc() - probe1_t0;
+        atomic_fetch_add_explicit(&probe1_cycles, d, memory_order_relaxed);
+        atomic_fetch_add_explicit(&probe1_calls, 1, memory_order_relaxed);
+        /************************************* probe_time code *************************************/
+        probe_time_t0 = rdtsc();
+    } else {
+        /************************************* probe_time code *************************************/
+        uint64_t d = rdtsc() - probe_time_t0;
+        atomic_fetch_add_explicit(&g_probe_time_stats.total_cycles, d, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_probe_time_stats.calls, 1, memory_order_relaxed);
+        printf("probe_time: function took %llu cycles\n", (unsigned long long)d);
     }
-    e = ctx->user_data; (*e)++;
 }
 
 static void probe2(struct patch_exec_context *ctx, uint8_t post) {
@@ -712,64 +725,7 @@ static void probe2(struct patch_exec_context *ctx, uint8_t post) {
     }
 }
 
-typedef struct {
-    _Atomic uint64_t calls;
-    _Atomic uint64_t total_cycles;
-} ProbeTimeStats;
-
-static ProbeTimeStats g_probe_time_stats = {0};
-static __thread uint64_t probe_time_t0 = 0;
-
-/* record function time */
-static void probe_time(struct patch_exec_context *ctx, uint8_t post) {
-    if (!post) {
-        probe_time_t0 = rdtsc();
-    } else {
-        uint64_t d = rdtsc() - probe_time_t0;
-        atomic_fetch_add_explicit(&g_probe_time_stats.total_cycles, d, memory_order_relaxed);
-        atomic_fetch_add_explicit(&g_probe_time_stats.calls, 1, memory_order_relaxed);
-        printf("probe_time: function took %llu cycles\n", (unsigned long long)d);
-    }
-}
-
-/* ------------------------- function-time measurement probe ------------------------- */
-
-/* installer: scans target function and places start & end probes */
-static void install_probe_time(void *func_addr, size_t max_bytes) {
-    if (!func_addr) {
-        fprintf(stderr, "[probe_time] invalid func_addr\n");
-        return;
-    }
-
-    printf("[probe_time] Installing timing probes at %p\n", func_addr);
-
-    /* install probe_time at function entry and exit */
-    {
-        struct patch_location location = {
-            .type        = PATCH_LOCATION_RANGE,
-            .direction   = PATCH_LOCATION_FORWARD,
-            .algorithm   = PATCH_LOCATION_FIRST,
-            // .range.lower = next,
-            .range.lower = (uintptr_t)func_addr,
-            .range.upper = 0,
-        };
-        struct patch_exec_model model = {
-            .type = PATCH_EXEC_MODEL_PROBE_RETURN,
-            .probe.read_registers    = 0,
-            .probe.write_registers   = 0,
-            .probe.clobber_registers = PATCH_REGS_ALL,
-            .probe.user_data         = NULL,
-            .probe.procedure         = &probe_time,
-        };
-        patch_t p;
-        ensure_patch(patch_make, &location, &model, NULL, &p, NULL);
-        ensure_patch(patch_enable, p);
-    }
-
-    ensure_patch(patch_commit);
-
-    printf("[probe_time] Installed function time probe\n");
-}
+/* ------------------------- summary ------------------------- */
 
 /* report collected timing results */
 void print_probe_time_summary(void) {
@@ -782,9 +738,6 @@ void print_probe_time_summary(void) {
            g_probe_time_stats.calls, avg_ns,
            (double)g_probe_time_stats.total_cycles / (double)g_probe_time_stats.calls);
 }
-
-
-/* ------------------------- summary ------------------------- */
 
 __attribute__((noinline))
 void print_test_summary(void) {
@@ -947,12 +900,10 @@ static void preload_init(void) {
 
     triggerdb_setup(&trigger_db, "config.yaml");
 
-    if (mode_probe1_enabled) install_probe1();
-    if (mode_probe2_enabled) { probe2_configure_all(); /* enabled on demand by probe1 */ }
-
-    // measure execution time of specific function
     uintptr_t target_func = program_base() + target_func_rel_offs;
-    install_probe_time((void*)target_func, target_func_max_bytes);
+
+    if (mode_probe1_enabled) install_probe1((void*)target_func);
+    if (mode_probe2_enabled) { probe2_configure_all(); /* enabled on demand by probe1 */ }
 
     uintptr_t addr = program_base();
     printf("libB: main executable base address: 0x%" PRIxPTR "\n", addr);
@@ -1006,7 +957,7 @@ uintptr_t base_address_for_pid(pid_t pid) {
 /* ------------------------- build hints ------------------------- */
 /*
 Compile:
-  gcc -shared -fPIC cft-auto-data-test.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch -lolx
+  gcc -shared -fPIC cft-auto-data-test.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch
 Run:
   LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
 */
