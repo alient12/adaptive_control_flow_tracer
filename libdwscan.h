@@ -137,6 +137,7 @@ typedef struct {
 typedef struct {
     char *name;        /* function name (owned by table) */
     uint64_t lowpc;    /* DW_AT_low_pc as reported by DWARF */
+    uint64_t size;     /* DW_AT_high_pc - DW_AT_low_pc */
 } FuncOffEntry;
 
 typedef struct {
@@ -189,6 +190,8 @@ void print_function_by_name(const char *name);
  */
 int dwarf_build_function_offset_table(void);
 
+int dwarf_update_function_offset_table_from_elf(int include_plt);
+
 /*
  * Lookup function low_pc by name.
  *
@@ -196,9 +199,9 @@ int dwarf_build_function_offset_table(void);
  *   func_name: function name to look up
  *   out_lowpc: output pointer for DW_AT_low_pc value
  *
- * Returns 1 if found and out_lowpc is set, 0 if not found or on error.
+ * Returns 0 if found and out_lowpc is set, 1 if not found or on error.
  */
-int dwarf_find_function_lowpc(const char *func_name, uint64_t *out_lowpc);
+int dwarf_find_function_lowpc(const char *func_name, uint64_t *out_lowpc, uint64_t *out_size);
 
 /*
  * Free function offset table resources.

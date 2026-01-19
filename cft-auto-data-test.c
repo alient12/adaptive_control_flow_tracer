@@ -52,7 +52,31 @@ static void                *trace_events_base = NULL;
 static trace_cpu_buffer_t  *trace_cpu_buffers = NULL;
 static int                  trace_n_cpus      = 0;
 
+/* ------------------------- trigger & probes ------------------------- */
 static TriggerDB trigger_db;
+
+typedef struct {
+    patch_t *patches;
+    bool    *ready;
+    bool    *enabled;
+    size_t   count;
+} Probe2Set;
+
+typedef struct {
+    uintptr_t target_addr;
+    uintptr_t trigger_addr;
+    char* target_name;
+    uint64_t target_size;
+    Probe2Set p2set;
+    size_t index;
+} ProbeID;
+
+typedef struct {
+    ProbeID *probe_addrs;
+    size_t      n_probes;
+} ProbeIDList;
+
+static ProbeIDList g_probe_list;
 
 /* ------------------------- probe time vars ------------------------- */
 typedef struct {
@@ -63,12 +87,9 @@ typedef struct {
 static ProbeTimeStats g_probe_time_stats = {0};
 static __thread uint64_t probe_time_t0 = 0;
 
-
 /* make &main safe to reference even if not exported */
 extern int main(int, char **, char **) __attribute__((weak));
 
-/* ---- forward decls so call sites compile cleanly ---- */
-typedef struct Probe2Set Probe2Set; /* defined later */
 int probe2_build_from_function(const void *func_addr,
                                size_t max_bytes,
                                Probe2Set *set,
@@ -99,7 +120,8 @@ void probe2_set_disable_all(Probe2Set *set);
 /* ------------------------- config & globals ------------------------- */
 
 bool mode_probe1_enabled = true;
-bool mode_probe2_enabled = false;
+bool mode_probe2_enabled = true;
+static const size_t    target_func_max_bytes = 4096;   // how many bytes to scan if failed to get function size
 
 static uintptr_t program_base(void); // early fwd so we can use it above
 
@@ -108,18 +130,6 @@ static void probe2(struct patch_exec_context *ctx, uint8_t ret);
 static void install_probe1(void *func_addr);
 static void print_libpatch_error(void);
 
-
-// static const uintptr_t func_rel_offs = 0x1195;  /* offset from main base to target site for probe1 */
-// static const uintptr_t func_rel_offs = 0x1175;  /* offset from main base to target site for probe1 */
-static const uintptr_t func_rel_offs = 0x2cf0;  /* offset from main base to target site for probe1 */
-
-// Function start you want to scan for jumps (offset from main base)
-// IMPORTANT: set this to the *function entry* you want to instrument.
-static const uintptr_t target_func_rel_offs = 0x2cf0;  // <-- change to your function's entry if needed
-// static const uintptr_t target_func_rel_offs = 0x1175;  // <-- change to your function's entry if needed
-// static const uintptr_t target_func_rel_offs = 0x1195;  // <-- change to your function's entry if needed
-// static const uintptr_t target_func_rel_offs = 0x122a;  // <-- change to your function's entry if needed
-static const size_t    target_func_max_bytes = 4096;   // how many bytes to scan
 
 typedef struct JumpSite {
     uintptr_t insn_addr;      // branch instruction address
@@ -155,14 +165,7 @@ static void dump_jump_sites(const JumpSite *sites, size_t n, uintptr_t base)
     }
 }
 
-typedef struct Probe2Set {
-    patch_t *patches;
-    bool    *ready;
-    bool    *enabled;
-    size_t   count;
-} Probe2Set;
 
-static Probe2Set g_p2set = {0};
 
 
 /* Fallback stub so the .so loads even if the real builder isn't linked. */
@@ -250,60 +253,6 @@ static int find_function_jumps(const void *func_addr,
     *out_count = w;
     return 0;
 }
-
-// /* ===== Build libpatch probe2 patches at each branch fallthrough ===== */
-// int probe2_build_from_function(const void *func_addr,
-//                                size_t max_bytes,
-//                                Probe2Set *set,
-//                                void (*handler)(struct patch_exec_context*, uint8_t),
-//                                void *user_data)
-// {
-//     if (!func_addr || !set || !handler) return -EINVAL;
-//     memset(set, 0, sizeof(*set));
-
-//     JumpSite *sites = NULL; size_t n = 0;
-//     int rc = find_function_jumps(func_addr, max_bytes, &sites, &n);
-//     if (rc) return rc;
-//     if (n == 0) { free(sites); return 0; }
-
-//     // Optional: print the discovered jump addresses
-//     dump_jump_sites(sites, n, program_base());
-
-//     set->patches = (patch_t*)calloc(n, sizeof(patch_t));
-//     set->ready   = (bool*)calloc(n, sizeof(bool));
-//     set->enabled = (bool*)calloc(n, sizeof(bool));
-//     if (!set->patches || !set->ready || !set->enabled) {
-//         free(sites); free(set->patches); free(set->ready); free(set->enabled);
-//         memset(set, 0, sizeof(*set));
-//         return -ENOMEM;
-//     }
-
-//     for (size_t i = 0; i < n; ++i) {
-//         const uintptr_t site = sites[i].next_addr; // patch after the branch
-//         struct patch_location location = {
-//             .type        = PATCH_LOCATION_RANGE,
-//             .direction   = PATCH_LOCATION_FORWARD,
-//             .algorithm   = PATCH_LOCATION_FIRST,
-//             .range.lower = site,
-//             .range.upper = 0,
-//         };
-//         struct patch_exec_model exec_model = {
-//             .type                    = PATCH_EXEC_MODEL_PROBE_AROUND,
-//             .probe.read_registers    = 0,
-//             .probe.write_registers   = 0,
-//             .probe.clobber_registers = PATCH_REGS_ALL,
-//             .probe.user_data         = user_data,
-//             .probe.procedure         = handler,
-//         };
-//         patch_status st = patch_make(&location, &exec_model, NULL, &set->patches[i], NULL);
-//         if (st == PATCH_OK) set->ready[i] = true; else print_libpatch_error();
-//     }
-//     free(sites);
-
-//     (void)patch_commit();
-//     set->count = n;
-//     return 0;
-// }
 
 /* ===== Build libpatch probe2 patches at each branch fallthrough ===== */
 int probe2_build_from_function(const void *func_addr,
@@ -605,28 +554,26 @@ static uintptr_t program_base(void) {
 
 /* ------------------------- probe management ------------------------- */
 
-static void probe2_configure_all(void) {
+static void probe2_configure_all(ProbeID *probe_addrs) {
     // Where to scan: program base + function entry offset
-    uintptr_t func_addr = program_base() + target_func_rel_offs;
+    uint64_t func_size = probe_addrs->target_size;
+    uintptr_t func_addr = probe_addrs->target_addr;
+    char *func_name = probe_addrs->target_name;
+    Probe2Set *p2set = &probe_addrs->p2set;
+
+    printf("[probe2-config] scanning function '%s' at %p (size=%" PRIu64 " bytes)\n",
+           func_name, (void*)func_addr, func_size);
     int rc = probe2_build_from_function((void*)func_addr,
-                                        target_func_max_bytes,
-                                        &g_p2set,
+                                        func_size,
+                                        p2set,
                                         &probe2,           // your existing handler
                                         &exit_value);      // your existing user_data
     if (rc) {
         fprintf(stderr, "[probe2-config] builder rc=%d\n", rc);
     } else {
-        fprintf(stderr, "[probe2-config] built %zu probe sites\n", g_p2set.count);
+        fprintf(stderr, "[probe2-config] built %zu probe sites\n", p2set->count);
     }
 }
-
-static void probe2_enable_all_global(void) {
-    probe2_enable_all(&g_p2set);
-}
-static void probe2_disable_all_global(void) {
-    probe2_disable_all(&g_p2set);
-}
-
 
 static void install_probe1(void *func_addr) {
     if (!func_addr) {
@@ -670,28 +617,41 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         /*************************************** probe 1 code **************************************/
         probe1_t0 = rdtsc();
         int x = (int)ctx->general_purpose_registers[PATCH_X86_64_RDI];
+        uintptr_t pc = (uintptr_t)ctx->program_counter;
+
+        // find probe index by pc
+        size_t probe_index = 0;
+        for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
+            if (pc >= g_probe_list.probe_addrs[i].target_addr &&
+                pc <  g_probe_list.probe_addrs[i].target_addr + g_probe_list.probe_addrs[i].target_size) {
+                probe_index = i;
+                break;
+            }
+        }
+        Probe2Set *p2set = &g_probe_list.probe_addrs[probe_index].p2set;
 
         uint64_t *raw;
-        const FuncSig *sig = trigger_db.entries[0].sig;
+        const FuncSig *sig = trigger_db.entries[probe_index].sig;
         extract_raw_args_sysv_x86_64(ctx, sig, raw);
 
-        int result = eval_compiled_trigger(&trigger_db.entries[0].compiled, sig, raw);
+        int result = eval_compiled_trigger(&trigger_db.entries[probe_index].compiled, sig, raw);
 
         //print raw args
-        printf("probe1: raw args: ");
+        printf("[probe1-%zu]: raw args: ", probe_index);
         for (size_t i = 0; i < sig->n_args; ++i) {
             printf("%" PRIu64 " ", raw[i]);
         }
         printf("\n");
-        printf("eval trigger result: %d\n", result);
-        int value = *(int*)raw[0];
-        printf("extracted value: %d\n", value);
-
-        // if (mode_probe2_enabled) {
-        //     if (x >= 5 && x < 10) probe2_enable_all_global(); else probe2_disable_all_global();
-        // }
-
-        // probe2_enable_all_global();
+        printf("[probe1-%zu]: eval trigger result: %d\n", probe_index, result);
+        
+        // // in case non-pointer var used as pointer
+        // int value = *(int*)raw[0];
+        // printf("extracted value: %d\n", value);
+        
+        // result = 1; // for testing, always enable probe2
+        if (mode_probe2_enabled) {
+            if (result) probe2_enable_all(p2set); else probe2_disable_all(p2set);
+        }
 
         uint64_t d = rdtsc() - probe1_t0;
         atomic_fetch_add_explicit(&probe1_cycles, d, memory_order_relaxed);
@@ -703,7 +663,7 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         uint64_t d = rdtsc() - probe_time_t0;
         atomic_fetch_add_explicit(&g_probe_time_stats.total_cycles, d, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_probe_time_stats.calls, 1, memory_order_relaxed);
-        printf("probe_time: function took %llu cycles\n", (unsigned long long)d);
+        printf("[probe_time]: function took %llu cycles\n", (unsigned long long)d);
     }
 }
 
@@ -900,10 +860,54 @@ static void preload_init(void) {
 
     triggerdb_setup(&trigger_db, "config.yaml");
 
-    uintptr_t target_func = program_base() + target_func_rel_offs;
+    for (size_t i = 0; i < trigger_db.n_entries; ++i) {
+        if (trigger_db.entries[i].func_size > 0) {
+            uintptr_t target_lowpc    = trigger_db.entries[i].func_lowpc;
+            uintptr_t trigger_lowpc = trigger_db.entries[i].trigger_func_lowpc;
+            char *target_name = trigger_db.entries[i].func_name;
+            uint64_t target_size = trigger_db.entries[i].func_size > 0 ? trigger_db.entries[i].func_size : target_func_max_bytes;
 
-    if (mode_probe1_enabled) install_probe1((void*)target_func);
-    if (mode_probe2_enabled) { probe2_configure_all(); /* enabled on demand by probe1 */ }
+            // check if name already in the list
+            for (size_t j = 0; j < g_probe_list.n_probes; ++j) {
+                if (strcmp(g_probe_list.probe_addrs[j].target_name, target_name) == 0) {
+                    // already exists
+                    target_lowpc = 0;
+                    trigger_lowpc = 0;
+                    break;
+                }
+            }
+            if (target_lowpc == 0 || trigger_lowpc == 0) continue;
+
+            g_probe_list.probe_addrs = (ProbeID*)realloc(g_probe_list.probe_addrs,
+                                                             (g_probe_list.n_probes + 1) * sizeof(ProbeID));
+            if (!g_probe_list.probe_addrs) {
+                fprintf(stderr, "[probe2-config] failed to realloc probe addrs\n");
+                return;
+            }
+            
+            g_probe_list.probe_addrs[g_probe_list.n_probes].target_addr  = program_base() + target_lowpc;
+            g_probe_list.probe_addrs[g_probe_list.n_probes].trigger_addr = program_base() + trigger_lowpc;
+            g_probe_list.probe_addrs[g_probe_list.n_probes].target_name = target_name;
+            g_probe_list.probe_addrs[g_probe_list.n_probes].target_size = target_size;
+            g_probe_list.probe_addrs[g_probe_list.n_probes].p2set = (Probe2Set){0};
+            g_probe_list.probe_addrs[g_probe_list.n_probes].index = i;
+            g_probe_list.n_probes++;
+        }
+    }
+
+    if (mode_probe1_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
+        install_probe1((void*)g_probe_list.probe_addrs[i].trigger_addr);
+    }
+    if (mode_probe2_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
+        probe2_configure_all(&g_probe_list.probe_addrs[i]); // enabled on demand by probe1
+    }
+
+    // uint64_t trigger_func_lowpc = trigger_db.entries[0].trigger_func_lowpc;
+    // uintptr_t trigger_func_addr = program_base() + trigger_func_lowpc;
+    
+
+    // if (mode_probe1_enabled) install_probe1((void*)trigger_func_addr);
+    // if (mode_probe2_enabled) { probe2_configure_all(); /* enabled on demand by probe1 */ }
 
     uintptr_t addr = program_base();
     printf("libB: main executable base address: 0x%" PRIxPTR "\n", addr);
@@ -950,14 +954,11 @@ uintptr_t base_address_for_pid(pid_t pid) {
     return base_addr;
 }
 
-/* ---- compatibility wrappers for older call sites ---- */
-// void probe2_set_enable_all(Probe2Set *set) { probe2_enable_all(set); }
-// void probe2_set_disable_all(Probe2Set *set) { probe2_disable_all(set); }
-
 /* ------------------------- build hints ------------------------- */
 /*
 Compile:
   gcc -shared -fPIC cft-auto-data-test.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch
 Run:
   LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
+  LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/data/test/input/inp.in
 */

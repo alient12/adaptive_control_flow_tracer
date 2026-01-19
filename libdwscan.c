@@ -797,12 +797,13 @@ static int fotab_grow(FuncOffTable *t, size_t need)
     return 0;
 }
 
-static int fotab_push(FuncOffTable *t, const char *name, uint64_t lowpc)
+static int fotab_push(FuncOffTable *t, const char *name, uint64_t lowpc, uint64_t size)
 {
     if (!name || !*name) return 0;
     if (fotab_grow(t, t->len + 1) != 0) return -1;
     t->items[t->len].name = xstrdup(name);
     t->items[t->len].lowpc = lowpc;
+    t->items[t->len].size = size;
     if (!t->items[t->len].name) return -1;
     t->len++;
     return 0;
@@ -841,6 +842,54 @@ static int die_lowpc_u64(Dwarf_Die subp_die, uint64_t *out_lowpc, Dwarf_Error *e
     return DW_DLV_OK;
 }
 
+static int die_highpc_u64(Dwarf_Die subp_die, uint64_t lowpc, uint64_t *out_highpc, Dwarf_Error *err)
+{
+    if (!out_highpc) return DW_DLV_ERROR;
+
+    Dwarf_Attribute at = 0;
+    int rc = dwarf_attr(subp_die, DW_AT_high_pc, &at, err);
+    if (rc != DW_DLV_OK) return rc; /* NO_ENTRY or ERROR */
+
+    /* Determine whether DW_AT_high_pc is an address or an offset. */
+    Dwarf_Half form = 0;
+    if (dwarf_whatform(at, &form, err) != DW_DLV_OK) return DW_DLV_ERROR;
+
+    /* DWARF4+: high_pc may be an offset (usually udata/sdata), not an address. */
+    switch (form) {
+        case DW_FORM_addr: {
+            Dwarf_Addr a = 0;
+            if (dwarf_formaddr(at, &a, err) != DW_DLV_OK) return DW_DLV_ERROR;
+            *out_highpc = (uint64_t)a;
+            return DW_DLV_OK;
+        }
+
+        /* Unsigned offset forms */
+        case DW_FORM_data1:
+        case DW_FORM_data2:
+        case DW_FORM_data4:
+        case DW_FORM_data8:
+        case DW_FORM_udata: {
+            Dwarf_Unsigned u = 0;
+            if (dwarf_formudata(at, &u, err) != DW_DLV_OK) return DW_DLV_ERROR;
+            *out_highpc = lowpc + (uint64_t)u;
+            return DW_DLV_OK;
+        }
+
+        /* Signed offset forms (less common but allowed) */
+        case DW_FORM_sdata: {
+            Dwarf_Signed s = 0;
+            if (dwarf_formsdata(at, &s, err) != DW_DLV_OK) return DW_DLV_ERROR;
+            if (s < 0) return DW_DLV_ERROR; /* defensive */
+            *out_highpc = lowpc + (uint64_t)s;
+            return DW_DLV_OK;
+        }
+
+        default:
+            /* Some exotic forms exist; you can expand if you hit them. */
+            return DW_DLV_ERROR;
+    }
+}
+
 static void walk_die_tree_collect_offsets(Dwarf_Die die, FuncOffTable *out, Dwarf_Error *err)
 {
     if (!die) return;
@@ -849,10 +898,15 @@ static void walk_die_tree_collect_offsets(Dwarf_Die die, FuncOffTable *out, Dwar
     if (dwarf_tag(die, &tag, err) == DW_DLV_OK && tag == DW_TAG_subprogram) {
         char *nm = NULL;
         if (dwarf_diename(die, &nm, err) == DW_DLV_OK && nm && nm[0]) {
-            uint64_t lowpc = 0;
-            if (die_lowpc_u64(die, &lowpc, err) == DW_DLV_OK) {
-                (void)fotab_push(out, nm, lowpc);
-            }
+            uint64_t lowpc = 0, highpc = 0;
+            int rc = die_lowpc_u64(die, &lowpc, err);
+            if (rc != DW_DLV_OK) return;
+
+            rc = die_highpc_u64(die, lowpc, &highpc, err);
+            if (rc != DW_DLV_OK) return;
+
+            uint64_t size = (highpc > lowpc) ? (highpc - lowpc) : 0;
+            (void)fotab_push(out, nm, lowpc, size);
         }
     }
 
@@ -929,19 +983,21 @@ int dwarf_build_function_offset_table(void)
     return 0;
 }
 
-/* Lookup helper (returns 1 if found, 0 otherwise). */
-int dwarf_find_function_lowpc(const char *func_name, uint64_t *out_lowpc)
+/* Lookup helper (returns 0 if found, 1 otherwise). */
+int dwarf_find_function_lowpc(const char *func_name, uint64_t *out_lowpc, uint64_t *out_size)
 {
-    if (!func_name || !*func_name || !out_lowpc) return 0;
-    if (dwarf_build_function_offset_table() != 0) return 0;
+    if (!func_name || !*func_name || !out_lowpc) return 1;
+    if (dwarf_build_function_offset_table() != 0) return 1;
 
     for (size_t i = 0; i < g_fotab.len; i++) {
         if (g_fotab.items[i].name && strcmp(g_fotab.items[i].name, func_name) == 0) {
             *out_lowpc = g_fotab.items[i].lowpc;
-            return 1;
+            *out_size  = g_fotab.items[i].size;
+            return 0;
         }
     }
-    return 0;
+    printf("dwarf_find_function_lowpc: function '%s' not found in FOTAB\n", func_name);
+    return 1;
 }
 
 /* ------------------------------ ELF symbol table (augment offset table) ------------------------------ */
@@ -985,16 +1041,17 @@ static int fotab_find_index(const FuncOffTable *t, const char *name)
     return -1;
 }
 
-static int fotab_upsert(FuncOffTable *t, const char *name, uint64_t addr)
+static int fotab_upsert(FuncOffTable *t, const char *name, uint64_t addr, uint64_t size)
 {
     if (!t || !name || !*name) return 0;
     int idx = fotab_find_index(t, name);
     if (idx >= 0) {
         /* Keep the original DWARF lowpc if present; otherwise fill it in. */
         if (t->items[idx].lowpc == 0 && addr != 0) t->items[idx].lowpc = addr;
+        if (t->items[idx].size  == 0 && size != 0) t->items[idx].size  = size;
         return 0;
     }
-    return fotab_push(t, name, addr);
+    return fotab_push(t, name, addr, size);
 }
 
 static int sym_is_interesting(const char *nm, uint8_t st_type, const char *secname, int include_plt)
@@ -1108,7 +1165,7 @@ static int elf_add_plt_stubs_from_relocs(int fd,
                 char buf[512];
                 snprintf(buf, sizeof(buf), "%s@plt", nm);
                 int before = (int)t->len;
-                (void)fotab_upsert(t, buf, stub);
+                (void)fotab_upsert(t, buf, stub, (uint64_t)plt_entsz);
                 if ((int)t->len > before) added++;
             }
 
@@ -1132,7 +1189,7 @@ static int elf_add_plt_stubs_from_relocs(int fd,
                 char buf[512];
                 snprintf(buf, sizeof(buf), "%s@plt", nm);
                 int before = (int)t->len;
-                (void)fotab_upsert(t, buf, stub);
+                (void)fotab_upsert(t, buf, stub, (uint64_t)plt_entsz);
                 if ((int)t->len > before) added++;
             }
 
@@ -1238,9 +1295,13 @@ static int elf_augment_fotab_from_fd(int fd, FuncOffTable *t, int include_plt)
                 /* Allow adding undefined dynsym entries if you want later, but skip for now */
                 continue;
             }
-
+            
             int before = (int)t->len;
-            if (fotab_upsert(t, nm, (uint64_t)s.st_value) != 0) {
+
+            uint64_t addr = (uint64_t)s.st_value;
+            uint64_t sz   = (uint64_t)s.st_size;   /* often 0 in dynsym/stripped builds */
+
+            if (fotab_upsert(t, nm, addr, sz) != 0) {
                 /* ignore OOM errors for now */
                 continue;
             }
@@ -1347,9 +1408,10 @@ void dwarf_model_free(DwarfModel *m)
 
 //     // print offset table
 //     for (size_t i = 0; i < g_fotab.len; i++) {
-//         printf("Function: %s -> low_pc: 0x%llx\n",
+//         printf("Function: %s -> low_pc: 0x%llx, size: 0x%llx\n",
 //                g_fotab.items[i].name,
-//                (unsigned long long)g_fotab.items[i].lowpc);
+//                (unsigned long long)g_fotab.items[i].lowpc,
+//                (unsigned long long)g_fotab.items[i].size);
 //     }
 
 //     print_function_by_name("price_out_impl");

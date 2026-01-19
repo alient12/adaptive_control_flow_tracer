@@ -185,14 +185,26 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
         return -4;
     }
 
+    dwarf_build_function_offset_table();
+    dwarf_update_function_offset_table_from_elf(1);
+
     /* Fill entries */
     size_t idx = 0;
     for (size_t ti = 0; ti < db->cfg.n_targets; ti++) {
         const TargetCfg *t = &db->cfg.targets[ti];
 
-        uint64_t func_off = 0, trig_off = 0;
-        (void)dwarf_find_function_lowpc(t->func, &func_off);
-        (void)dwarf_find_function_lowpc(t->trigger_func, &trig_off);
+        uint64_t func_off = 0, func_size = 0;
+        uint64_t trig_off = 0, trig_size = 0;
+        
+        (void)dwarf_find_function_lowpc(t->func, &func_off, &func_size);
+        (void)dwarf_find_function_lowpc(t->trigger_func, &trig_off, &trig_size);
+
+        printf("[triggerdb-setup] Target %zu: Func=%s, Offset=0x%lx, Size=0x%lx, Recursive=%d, TriggerFunc=%s, TriggerOffset=0x%lx, TriggerSize=0x%lx, Triggers=[",
+               ti, t->func, func_off, func_size, t->recursive, t->trigger_func, trig_off, trig_size);
+        for (size_t j = 0; j < t->triggers.n; j++) {
+            printf("%s\"%s\"", (j > 0) ? ", " : "", t->triggers.items[j]);
+        }
+        printf("]\n");
 
         const FuncSig *sig = find_funcsig_by_name(db->model, t->trigger_func);
         if (!sig) {
@@ -209,9 +221,11 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
 
             e->func_name  = tc_strdup_local(t->func);
             e->func_lowpc = func_off;
+            e->func_size  = func_size;
 
             e->trigger_func_name  = tc_strdup_local(t->trigger_func);
             e->trigger_func_lowpc = trig_off;
+            e->trigger_func_size  = trig_size;
 
             e->recursive  = t->recursive;
 
@@ -262,11 +276,15 @@ void demo()
     for (size_t i = 0; i < cfg.n_targets; i++) {
         const TargetCfg *t = &cfg.targets[i];
 
-        uint64_t offset, trigger_offset;
-        dwarf_find_function_lowpc(t->func, &offset);
-        dwarf_find_function_lowpc(t->trigger_func, &trigger_offset);
+        dwarf_build_function_offset_table();
+        dwarf_update_function_offset_table_from_elf(/*include_plt=*/1);
         
-        printf("Target %zu: Func=%s, Offset=0x%lx, Recursive=%d, TriggerFunc=%s, TriggerOffset=0x%lx, Triggers=[", i, t->func, offset, t->recursive, t->trigger_func, trigger_offset);
+        uint64_t offset, trigger_offset;
+        uint64_t size, trigger_size;
+        dwarf_find_function_lowpc(t->func, &offset, &size);
+        dwarf_find_function_lowpc(t->trigger_func, &trigger_offset, &trigger_size);
+        
+        printf("Target %zu: Func=%s, Offset=0x%lx, Size=0x%lx, Recursive=%d, TriggerFunc=%s, TriggerOffset=0x%lx, TriggerSize=0x%lx, Triggers=[", i, t->func, offset, size, t->recursive, t->trigger_func, trigger_offset, trigger_size);
         for (size_t j = 0; j < t->triggers.n; j++) {
             printf("%s\"%s\"", (j > 0) ? ", " : "", t->triggers.items[j]);
         }

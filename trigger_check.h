@@ -29,10 +29,12 @@ typedef struct TriggerEntry {
     /* target function */
     char       *func_name;
     uint64_t    func_lowpc;
+    uint64_t    func_size;
 
     /* trigger function (the function whose args are used in trigger expr) */
     char       *trigger_func_name;
     uint64_t    trigger_func_lowpc;
+    uint64_t    trigger_func_size;
 
     /* config */
     int         recursive;
