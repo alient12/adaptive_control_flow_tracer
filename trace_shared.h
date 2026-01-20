@@ -24,6 +24,7 @@ typedef struct {
     uint32_t capacity;     // events per CPU (TRACE_BUF_CAPACITY)
     uint32_t record_size;  // sizeof(trace_event_t)
     uint32_t _pad;
+    uint32_t cycles_per_ns; // calibrated cycles per nanosecond
 } trace_meta_global_t;
 
 // Per-CPU metadata (shared)

@@ -764,6 +764,7 @@ void trace_buffers_init(void)
     trace_gmeta->capacity    = TRACE_BUF_CAPACITY;
     trace_gmeta->record_size = sizeof(trace_event_t);
     trace_gmeta->_pad        = 0;
+    trace_gmeta->cycles_per_ns = (uint32_t)cycles_per_ns;
 
     // Initialise per-CPU meta
     for (int i = 0; i < trace_n_cpus; ++i) {
@@ -859,6 +860,7 @@ static void preload_init(void) {
     ensure_patch(patch_init, options, array_size(options));
 
     triggerdb_setup(&trigger_db, "config.yaml");
+    trace_buffers_init();
 
     for (size_t i = 0; i < trigger_db.n_entries; ++i) {
         if (trigger_db.entries[i].func_size > 0) {
@@ -902,21 +904,8 @@ static void preload_init(void) {
         probe2_configure_all(&g_probe_list.probe_addrs[i]); // enabled on demand by probe1
     }
 
-    // uint64_t trigger_func_lowpc = trigger_db.entries[0].trigger_func_lowpc;
-    // uintptr_t trigger_func_addr = program_base() + trigger_func_lowpc;
-    
-
-    // if (mode_probe1_enabled) install_probe1((void*)trigger_func_addr);
-    // if (mode_probe2_enabled) { probe2_configure_all(); /* enabled on demand by probe1 */ }
-
     uintptr_t addr = program_base();
     printf("libB: main executable base address: 0x%" PRIxPTR "\n", addr);
-}
-
-__attribute__((constructor))
-static void trace_constructor(void)
-{
-    trace_buffers_init();
 }
 
 /* ------------------------- destructor ------------------------- */
