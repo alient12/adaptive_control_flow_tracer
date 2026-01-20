@@ -33,6 +33,7 @@ typedef struct {
     uint32_t cpu;
     uint32_t pad;
     uint64_t tsc;
+    uint64_t time_ns;
     uint64_t value;
 } trace_disk_record_t;
 
@@ -237,6 +238,7 @@ int main(int argc, char **argv)
                 rec.cpu   = cpu;
                 rec.pad   = 0;
                 rec.tsc   = ev.tsc;
+                rec.time_ns = ev.tsc / (uint64_t)cycles_per_ns;
                 rec.value = ev.value;
 
                 if (debug) {
@@ -245,7 +247,7 @@ int main(int argc, char **argv)
                         rec.cpu,
                         rec.tsc,
                         rec.tsc,
-                        rec.tsc/(uint64_t)cycles_per_ns,
+                        rec.time_ns,
                         rec.value);
                 }
 
@@ -300,6 +302,7 @@ int main(int argc, char **argv)
             rec.cpu   = cpu;
             rec.pad   = 0;
             rec.tsc   = ev.tsc;
+            rec.time_ns = ev.tsc / (uint64_t)cycles_per_ns;
             rec.value = ev.value;
 
             fwrite(&rec, sizeof(rec), 1, out);
