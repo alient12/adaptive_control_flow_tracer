@@ -25,6 +25,10 @@
 #include <stdlib.h>
 #include <ctype.h>
 
+#include <sys/uio.h>
+#include <unistd.h>
+#include <errno.h>
+
 #include "trigger_compiler.h"
 
 /* ============================== Timing helpers =============================== */
@@ -115,7 +119,7 @@ int resolve_member_path(void *base_addr,
 
         if (t && t->kind == VT_POINTER) {
             /* Follow pointer value stored at 'addr' */
-            memcpy(&addr, addr, sizeof(void*));
+            // memcpy(&addr, addr, sizeof(void*));
             if (!addr) return -3;
             t = t->pointee;
         }
@@ -132,23 +136,6 @@ int resolve_member_path(void *base_addr,
 
     *out_addr = addr;
     *out_type = t;
-    return 0;
-}
-
-/* ======================= TEMP read (stub) ======================= */
-
-/* Read raw 64-bit scalar safely (no casting)
-   TEMP: returns pseudo-random so you can validate the pipeline.
-*/
-int read_u64(void *addr, uint64_t *out)
-{
-    (void)addr;
-    if (!out) return -1;
-    static uint64_t seed = 0x12345678abcdefULL;
-    seed ^= seed << 7;
-    seed ^= seed >> 9;
-    seed ^= seed << 8;
-    *out = seed;
     return 0;
 }
 
@@ -206,17 +193,155 @@ static int parse_arg_index(const char *ident)
     return (int)v;
 }
 
+/* ======================= TEMP read (stub) ======================= */
+
+/* Read raw 64-bit scalar safely (no casting)
+   TEMP: returns pseudo-random so you can validate the pipeline.
+*/
+int read_u64(void *addr, uint64_t *out)
+{
+    (void)addr;
+    if (!out) return -1;
+    static uint64_t seed = 0x12345678abcdefULL;
+    seed ^= seed << 7;
+    seed ^= seed >> 9;
+    seed ^= seed << 8;
+    *out = seed;
+    return 0;
+}
+
+
+static int safe_read_bytes(const void *addr, void *dst, size_t n)
+{
+    struct iovec local  = { .iov_base = dst,        .iov_len = n };
+    struct iovec remote = { .iov_base = (void*)addr, .iov_len = n };
+
+    ssize_t r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (r < 0) return -errno;
+    if ((size_t)r != n) return -EIO;
+    return 0;
+}
+
+static int safe_read_ptr(const void *addr, void **out)
+{
+    return safe_read_bytes(addr, out, sizeof(void*));
+}
+
+static int read_scalar_value(void *addr, const VarType *t, ValueKind hint, Value *out)
+{
+    if (!out) return -1;
+    *out = V_invalid();
+
+    t = vt_unwrap(t);
+    if (!t || !addr) return -2;
+
+    /* Strings are handled elsewhere (cstring ptr), this is for scalars in memory */
+    if (hint == VK_FLOAT) {
+        /* float/double by name (best effort) */
+        if (t->kind == VT_BASE && t->name && strcmp(t->name, "float") == 0) {
+            float fv = 0.0f;
+            // memcpy(&fv, addr, sizeof(fv));
+            if (safe_read_bytes(addr, &fv, sizeof(fv)) != 0)
+            {
+                printf("[error] safe_read_bytes failed for float read at %p\n", addr);
+                return 1;
+            }
+            *out = V_float((double)fv);
+            return 0;
+        }
+        if (t->kind == VT_BASE && t->name && strcmp(t->name, "double") == 0) {
+            double dv = 0.0;
+            // memcpy(&dv, addr, sizeof(dv));
+            if (safe_read_bytes(addr, &dv, sizeof(dv)) != 0)
+            {
+                printf("[error] safe_read_bytes failed for double read at %p\n", addr);
+                return 1;
+            }
+            *out = V_float(dv);
+            return 0;
+        }
+    }
+
+    /* Integer widths: best effort by type name */
+    size_t sz = 0;
+
+    if (t->kind == VT_BASE && t->name) {
+        if (!strcmp(t->name,"char") || !strcmp(t->name,"signed char") || !strcmp(t->name,"unsigned char")) sz = 1;
+        else if (!strcmp(t->name,"short") || !strcmp(t->name,"short int") || !strcmp(t->name,"unsigned short") || !strcmp(t->name,"unsigned short int")) sz = 2;
+        else if (!strcmp(t->name,"int") || !strcmp(t->name,"unsigned int")) sz = 4;
+        else if (!strcmp(t->name,"long") || !strcmp(t->name,"unsigned long") ||
+                 !strcmp(t->name,"long int") || !strcmp(t->name,"unsigned long int")) sz = 8; /* x86_64 assumption */
+        else if (!strcmp(t->name,"long long") || !strcmp(t->name,"unsigned long long")) sz = 8;
+    }
+    if (t->kind == VT_POINTER) sz = sizeof(void*);
+
+    if (sz == 1) {
+        int8_t v = 0; //memcpy(&v, addr, 1);
+        if (safe_read_bytes(addr, &v, 1) != 0)
+        {
+            printf("[error] safe_read_bytes failed for int8 read at %p\n", addr);
+            return 1;
+        }
+        *out = V_int((int64_t)v);
+        return 0;
+    }
+    if (sz == 2) {
+        int16_t v = 0; //memcpy(&v, addr, 2);
+        if (safe_read_bytes(addr, &v, 2) != 0)
+        {
+            printf("[error] safe_read_bytes failed for int16 read at %p\n", addr);
+            return 1;
+        }
+        *out = V_int((int64_t)v);
+        return 0;
+    }
+    if (sz == 4) {
+        int32_t v = 0; //memcpy(&v, addr, 4);
+        if (safe_read_bytes(addr, &v, 4) != 0)
+        {
+            printf("[error] safe_read_bytes failed for int32 read at %p\n", addr);
+            return 1;
+        }
+        *out = V_int((int64_t)v);
+        return 0;
+    }
+    if (sz == 8) {
+        int64_t v = 0; //memcpy(&v, addr, 8);
+        if (safe_read_bytes(addr, &v, 8) != 0)
+        {
+            printf("[error] safe_read_bytes failed for int64 read at %p\n", addr);
+            return 1;
+        }
+        *out = V_int(v);
+        return 0;
+    }
+
+    /* fallback: old behavior */
+    uint64_t vv = 0;
+    if (read_u64(addr, &vv) != 0) return -3;
+    *out = V_int((int64_t)vv);
+    return 0;
+}
+
 /* ---------- Precompiled variable reference ---------- */
 
 typedef enum {
     STEP_ADD_OFFSET = 1,
-    STEP_DEREF_PTR  = 2
+    STEP_DEREF_PTR  = 2,
+    STEP_ADD_INDEX  = 3   // addr += index * stride
 } StepKind;
 
 typedef struct {
     StepKind kind;
-    uint32_t offset; /* only for ADD_OFFSET */
+    uint32_t offset;   // STEP_ADD_OFFSET uses offset
+    int32_t  index;    // STEP_ADD_INDEX uses index
+    uint32_t stride;   // STEP_ADD_INDEX uses stride
 } AccessStep;
+
+typedef enum {
+    VREF_VALUE = 0,   // current behavior: evaluate to scalar/string
+    VREF_ADDR  = 1    // address-of: evaluate to pointer/integer address
+} VarRefMode;
 
 typedef struct {
     int arg_index;            /* argN */
@@ -224,6 +349,9 @@ typedef struct {
     const VarType *final_type;/* best-effort */
     AccessStep *steps;
     size_t n_steps;
+
+    VarRefMode mode;        // NEW: value vs address
+    uint32_t extra_deref;   // NEW: number of extra deref ops from unary '*'
 } VarRef;
 
 static void varref_free(VarRef *v)
@@ -272,6 +400,8 @@ static int compile_member_path_steps(const VarType *arg_type,
         steps = nn;
         steps[n].kind = STEP_ADD_OFFSET;
         steps[n].offset = (uint32_t)m->offset;
+        steps[n].index = 0;
+        steps[n].stride = 0;
         n++;
 
         t = m->type;
@@ -284,6 +414,8 @@ static int compile_member_path_steps(const VarType *arg_type,
                 steps = nn;
                 steps[n].kind = STEP_DEREF_PTR;
                 steps[n].offset = 0;
+                steps[n].index = 0;
+                steps[n].stride = 0;
                 n++;
                 t = ut->pointee;
             }
@@ -296,6 +428,32 @@ static int compile_member_path_steps(const VarType *arg_type,
     return 0;
 }
 
+static size_t vartype_sizeof_temp(const VarType *t)
+{
+    t = vt_unwrap(t);
+    if (!t) return 0;
+
+    // Later should use VarType size field:
+    // if (t->byte_size > 0) return (size_t)t->byte_size;
+
+    // Fallback for common base types by name (best effort):
+    if (t->kind == VT_BASE && t->name) {
+        if (!strcmp(t->name,"char") || !strcmp(t->name,"signed char") || !strcmp(t->name,"unsigned char")) return 1;
+        if (!strcmp(t->name,"short")|| !strcmp(t->name,"short int") || !strcmp(t->name,"unsigned short")) return 2;
+        if (!strcmp(t->name,"int")  || !strcmp(t->name,"unsigned int")) return 4;
+        if (!strcmp(t->name,"long") || !strcmp(t->name,"unsigned long")) return 8;  // x86_64 assumption
+        if (!strcmp(t->name,"long long") || !strcmp(t->name,"unsigned long long")) return 8;
+        if (!strcmp(t->name,"float")) return 4;
+        if (!strcmp(t->name,"double")) return 8;
+    }
+
+    // pointers on x86_64
+    if (t->kind == VT_POINTER) return sizeof(void*);
+
+    // structs/unions: if you have a byte size, use it; otherwise unknown
+    return 0;
+}
+
 static VarRef varref_from_tokens(const FuncSig *sig, const char *arg_ident, const char *member_path)
 {
     VarRef r;
@@ -303,6 +461,8 @@ static VarRef varref_from_tokens(const FuncSig *sig, const char *arg_ident, cons
     r.arg_index = -1;
     r.hint_kind = VK_INT;
     r.final_type = NULL;
+    r.mode = VREF_VALUE;
+    r.extra_deref = 0;
 
     int idx = parse_arg_index(arg_ident);
     if (idx < 0 || !sig || (size_t)idx >= sig->n_args) return r;
@@ -342,6 +502,75 @@ static VarRef varref_from_tokens(const FuncSig *sig, const char *arg_ident, cons
     return r;
 }
 
+static int varref_append_index(VarRef *r, int idx)
+{
+    if (!r) return -1;
+
+    const VarType *t = vt_unwrap(r->final_type);
+    if (!t) return -2;
+
+    // allow indexing on:
+    // - pointer-to-T : treat as base address, stride sizeof(T)
+    // - array-of-T   : same idea if your VarType supports arrays
+    const VarType *elem = NULL;
+
+    if (t->kind == VT_POINTER) {
+        elem = t->pointee;
+    } else {
+        // if you have VT_ARRAY, handle it here:
+        // if (t->kind == VT_ARRAY) elem = t->elem_type;
+        return -3;
+    }
+
+    size_t stride = vartype_sizeof_temp(elem);
+    if (stride == 0) return -4;
+
+    AccessStep *nn = realloc(r->steps, (r->n_steps + 1) * sizeof(AccessStep));
+    if (!nn) return -5;
+    r->steps = nn;
+
+    r->steps[r->n_steps].kind = STEP_ADD_INDEX;
+    r->steps[r->n_steps].index = (int32_t)idx;
+    r->steps[r->n_steps].stride = (uint32_t)stride;
+    r->steps[r->n_steps].offset = 0;
+    r->n_steps++;
+
+    // after indexing, the "type" becomes elem
+    r->final_type = elem;
+
+    // update hint
+    if (is_cstring_ptr(r->final_type)) r->hint_kind = VK_STRING;
+    else {
+        const VarType *bt = vt_unwrap(r->final_type);
+        if (bt && bt->kind == VT_BASE && is_floatish_name(bt->name)) r->hint_kind = VK_FLOAT;
+        else r->hint_kind = VK_INT;
+    }
+
+    return 0;
+}
+
+static const char *read_cstring(uint64_t raw_ptr)
+{
+    static _Thread_local char buf[256];
+    uintptr_t p = (uintptr_t)raw_ptr;
+    if (!p) return "";
+
+    size_t i = 0;
+    for (; i + 1 < sizeof(buf); i++) {
+        char ch = 0;
+        // memcpy(&ch, (void*)(p + i), 1);
+        if (safe_read_bytes((void*)(p + i), &ch, 1) != 0)
+        {
+            printf("[error] safe_read_bytes failed for cstring read at %p\n", (void*)(p + i));
+            break;
+        }
+        if (ch == 0) break;
+        buf[i] = ch;
+    }
+    buf[i] = 0;
+    return buf;
+}
+
 static Value eval_varref(const VarRef *v, const FuncSig *sig, const uint64_t *raw_args)
 {
     (void)sig;
@@ -350,7 +579,7 @@ static Value eval_varref(const VarRef *v, const FuncSig *sig, const uint64_t *ra
     uint64_t raw = raw_args[v->arg_index];
 
     if (v->hint_kind == VK_STRING) {
-        return V_str("<cstring>");
+        return V_str(read_cstring(raw));
     }
 
     if (!v->steps || v->n_steps == 0) {
@@ -366,17 +595,38 @@ static Value eval_varref(const VarRef *v, const FuncSig *sig, const uint64_t *ra
             addr += (uintptr_t)st->offset;
         } else if (st->kind == STEP_DEREF_PTR) {
             void *next = NULL;
-            memcpy(&next, (void*)addr, sizeof(void*));
+            if (safe_read_ptr((void*)addr, &next) != 0)
+            {
+                printf("[error] safe_read_ptr failed for deref at %p\n", (void*)addr);
+                return V_invalid();
+            }
             addr = (uintptr_t)next;
             if (!addr) return V_invalid();
+        } else if (st->kind == STEP_ADD_INDEX) {
+            addr += (uintptr_t)((int64_t)st->index * (int64_t)st->stride);
         }
     }
 
-    uint64_t vv = 0;
-    if (read_u64((void*)addr, &vv) != 0) return V_invalid();
+    for (uint32_t k = 0; k < v->extra_deref; k++) {
+        void *next = NULL;
+        if (safe_read_ptr((void*)addr, &next) != 0)
+        {
+            printf("[error] safe_read_ptr failed for extra deref at %p\n", (void*)addr);
+            return V_invalid();
+        }
+        addr = (uintptr_t)next;
+        if (!addr) return V_invalid();
+    }
 
-    if (v->hint_kind == VK_FLOAT) return V_float((double)(int64_t)vv);
-    return V_int((int64_t)vv);
+    if (v->mode == VREF_ADDR) {
+        // return address as int
+        return V_int((int64_t)(uintptr_t)addr);
+    }
+
+    Value out = V_invalid();
+    if (read_scalar_value((void*)addr, v->final_type, v->hint_kind, &out) != 0)
+        return V_invalid();
+    return out;
 }
 
 /* ---------- Tokenizer for trigger language ---------- */
@@ -391,7 +641,9 @@ typedef enum {
     TK_FLOAT,
     TK_STRING,
     TK_IDENT,
-    TK_DOT
+    TK_DOT,
+    TK_STAR, TK_AMP, TK_LBRACK, TK_RBRACK,
+    TK_ARROW
 } TokKind;
 
 typedef struct {
@@ -410,6 +662,38 @@ typedef struct {
 static void lex_skip_ws(Lexer *L){ while (L->s[L->i] && isspace((unsigned char)L->s[L->i])) L->i++; }
 static int  lex_peek(Lexer *L){ return (unsigned char)L->s[L->i]; }
 
+static void lex_read_quoted(Lexer *L, char quote_char)
+{
+    /* assume current char is quote_char */
+    L->i++; /* skip opening quote */
+
+    size_t k = 0;
+    while (L->s[L->i] && L->s[L->i] != quote_char) {
+        char ch = L->s[L->i++];
+
+        /* Optional: basic escapes in double quotes, and allow \' inside single quotes */
+        if (ch == '\\' && L->s[L->i]) {
+            char e = L->s[L->i++];
+            if (e == 'n') ch = '\n';
+            else if (e == 't') ch = '\t';
+            else if (e == 'r') ch = '\r';
+            else if (e == '\\') ch = '\\';
+            else if (e == '"' ) ch = '"';
+            else if (e == '\'') ch = '\'';
+            else ch = e; /* fallback: literal */
+        }
+
+        if (k + 1 < sizeof(L->cur.text)) L->cur.text[k++] = ch;
+    }
+
+    /* consume closing quote if present */
+    if (L->s[L->i] == quote_char) L->i++;
+
+    L->cur.text[k] = 0;
+    L->cur.kind = TK_STRING;
+}
+
+
 static void lex_next(Lexer *L)
 {
     lex_skip_ws(L);
@@ -424,26 +708,21 @@ static void lex_next(Lexer *L)
     if (c=='!' && L->s[L->i+1]=='=') { L->i+=2; L->cur.kind=TK_NE;  return; }
     if (c=='<' && L->s[L->i+1]=='=') { L->i+=2; L->cur.kind=TK_LE;  return; }
     if (c=='>' && L->s[L->i+1]=='=') { L->i+=2; L->cur.kind=TK_GE;  return; }
-
+    if (c=='-' && L->s[L->i+1]=='>') { L->i+=2; L->cur.kind=TK_ARROW; return; }
+    
     if (c=='(') { L->i++; L->cur.kind=TK_LPAREN; return; }
     if (c==')') { L->i++; L->cur.kind=TK_RPAREN; return; }
     if (c=='<') { L->i++; L->cur.kind=TK_LT; return; }
     if (c=='>') { L->i++; L->cur.kind=TK_GT; return; }
     if (c=='.') { L->i++; L->cur.kind=TK_DOT; return; }
     if (c=='=') { L->i++; L->cur.kind=TK_ASSIGN; return; }
+    if (c=='&') { L->i++; L->cur.kind=TK_AMP; return; }
+    if (c=='*') { L->i++; L->cur.kind=TK_STAR; return; }
+    if (c=='[') { L->i++; L->cur.kind=TK_LBRACK; return; }
+    if (c==']') { L->i++; L->cur.kind=TK_RBRACK; return; }
 
-    if (c=='\"') {
-        L->i++;
-        size_t k=0;
-        while (L->s[L->i] && L->s[L->i] != '\"') {
-            if (k + 1 < sizeof(L->cur.text)) L->cur.text[k++] = L->s[L->i];
-            L->i++;
-        }
-        if (L->s[L->i] == '\"') L->i++;
-        L->cur.text[k] = 0;
-        L->cur.kind = TK_STRING;
-        return;
-    }
+    if (c == '"')  { lex_read_quoted(L, '"');  return; }
+    if (c == '\'') { lex_read_quoted(L, '\''); return; }
 
     if (isdigit(c)) {
         size_t start = L->i;
@@ -456,7 +735,13 @@ static void lex_next(Lexer *L)
             size_t n = L->i - start;
             char tmp[128];
             if (n >= sizeof(tmp)) n = sizeof(tmp)-1;
-            memcpy(tmp, L->s+start, n); tmp[n]=0;
+            // memcpy(tmp, L->s+start, n); tmp[n]=0;
+            if (safe_read_bytes(L->s+start, tmp, n) != 0)
+            {
+                printf("[error] safe_read_bytes failed for hex number read\n");
+                L->cur.kind = TK_EOF;
+                return;
+            }
             L->cur.kind = TK_NUMBER;
             L->cur.i = (int64_t)strtoll(tmp, NULL, 16);
             return;
@@ -469,7 +754,14 @@ static void lex_next(Lexer *L)
         size_t n = L->i - start;
         char tmp[128];
         if (n >= sizeof(tmp)) n = sizeof(tmp)-1;
-        memcpy(tmp, L->s+start, n); tmp[n]=0;
+        // memcpy(tmp, L->s+start, n); tmp[n]=0;
+        if (safe_read_bytes(L->s+start, tmp, n) != 0)
+        {
+            printf("[error] safe_read_bytes failed for decimal number read\n");
+            L->cur.kind = TK_EOF;
+            return;
+        }
+        tmp[n] = 0;
 
         if (has_dot) {
             L->cur.kind = TK_FLOAT;
@@ -590,9 +882,23 @@ static void cconsume(CParser *P, TokKind k)
 
 static Node *parse_ast_primary(CParser *P)
 {
+    if (!P) return NULL;
+
+    /* Handle prefix ops first (so *arg0... works) */
+    int saw_addr = 0;
+    int deref_count = 0;
+    while (P->L.cur.kind == TK_AMP || P->L.cur.kind == TK_STAR) {
+        if (P->L.cur.kind == TK_AMP) saw_addr = 1;
+        else deref_count++;
+        lex_next(&P->L);
+    }
+
     Token t = P->L.cur;
 
     if (t.kind == TK_NUMBER) {
+        /* Disallow prefix ops on non-lvalues in your minimal language */
+        if (saw_addr || deref_count) return NULL;
+
         Node *n = node_new(N_CONST);
         if (!n) return NULL;
         n->u.cval = V_int(t.i);
@@ -601,6 +907,8 @@ static Node *parse_ast_primary(CParser *P)
     }
 
     if (t.kind == TK_FLOAT) {
+        if (saw_addr || deref_count) return NULL;
+
         Node *n = node_new(N_CONST);
         if (!n) return NULL;
         n->u.cval = V_float(t.f);
@@ -609,6 +917,8 @@ static Node *parse_ast_primary(CParser *P)
     }
 
     if (t.kind == TK_STRING) {
+        if (saw_addr || deref_count) return NULL;
+
         Node *n = node_new(N_CONST);
         if (!n) return NULL;
         n->u.cval = V_str(xstrdup(t.text));
@@ -622,35 +932,79 @@ static Node *parse_ast_primary(CParser *P)
         arg_ident[sizeof(arg_ident)-1] = 0;
         lex_next(&P->L);
 
+        /* Collect member path + constant indices (allow mixing: a.b[3].c) */
         char path[512]; path[0] = 0;
-        while (P->L.cur.kind == TK_DOT) {
-            lex_next(&P->L);
-            if (P->L.cur.kind != TK_IDENT) break;
-            if (path[0]) strncat(path, ".", sizeof(path)-strlen(path)-1);
-            strncat(path, P->L.cur.text, sizeof(path)-strlen(path)-1);
-            lex_next(&P->L);
+        int idxs[16]; int nidx = 0;
+
+        for (;;) {
+            if (P->L.cur.kind == TK_DOT || P->L.cur.kind == TK_ARROW) {
+                lex_next(&P->L);
+                if (P->L.cur.kind != TK_IDENT) return NULL; /* strict */
+                if (path[0]) strncat(path, ".", sizeof(path)-strlen(path)-1);
+                strncat(path, P->L.cur.text, sizeof(path)-strlen(path)-1);
+                lex_next(&P->L);
+                continue;
+            }
+
+            if (P->L.cur.kind == TK_LBRACK) {
+                lex_next(&P->L);
+                if (P->L.cur.kind != TK_NUMBER) return NULL; /* const index only */
+                if (nidx < (int)(sizeof(idxs)/sizeof(idxs[0]))) {
+                    idxs[nidx++] = (int)P->L.cur.i;
+                } else {
+                    return NULL;
+                }
+                lex_next(&P->L);
+                if (P->L.cur.kind != TK_RBRACK) return NULL;
+                lex_next(&P->L);
+                continue;
+            }
+
+            break;
         }
 
         Node *n = node_new(N_VAR);
         if (!n) return NULL;
+
         n->u.vref = varref_from_tokens(P->sig, arg_ident, path[0] ? path : NULL);
+        if (n->u.vref.arg_index < 0) { node_free(n); return NULL; }
+
+        for (int k = 0; k < nidx; k++) {
+            if (varref_append_index(&n->u.vref, idxs[k]) != 0) {
+                node_free(n);
+                return NULL;
+            }
+        }
+
+        /* Apply prefix ops to this VarRef */
+        if (saw_addr) {
+            n->u.vref.mode = VREF_ADDR;
+            if (deref_count > 0) { node_free(n); return NULL; } /* keep simple */
+        } else {
+            n->u.vref.extra_deref = (uint32_t)deref_count;
+        }
+
         return n;
     }
 
     if (t.kind == TK_LPAREN) {
+        /* In minimal design: disallow prefix ops on (...) */
+        if (saw_addr || deref_count) return NULL;
+
         lex_next(&P->L);
         Node *e = parse_ast_expr(P);
         cconsume(P, TK_RPAREN);
         return e;
     }
 
-    lex_next(&P->L);
+    /* Unknown token */
     return NULL;
 }
 
 static Node *parse_ast_cmp(CParser *P)
 {
     Node *left = parse_ast_primary(P);
+    if (!left) printf("[parse] null node returned from primary\n");
     if (!left) return NULL;
 
     TokKind op = P->L.cur.kind;
@@ -673,6 +1027,7 @@ static Node *parse_ast_cmp(CParser *P)
 static Node *parse_ast_and(CParser *P)
 {
     Node *n = parse_ast_cmp(P);
+    if (!n) printf("[parse] null node returned from CMP\n");
     if (!n) return NULL;
 
     while (P->L.cur.kind == TK_AND) {
@@ -692,6 +1047,7 @@ static Node *parse_ast_and(CParser *P)
 static Node *parse_ast_or(CParser *P)
 {
     Node *n = parse_ast_and(P);
+    if (!n) printf("[parse] null node returned from AND\n");
     if (!n) return NULL;
 
     while (P->L.cur.kind == TK_OR) {
@@ -780,6 +1136,17 @@ static Value eval_node(const Node *n, const FuncSig *sig, const uint64_t *raw_ar
         case N_CMP: {
             Value a = eval_node(n->u.cmp.l, sig, raw_args);
             Value b = eval_node(n->u.cmp.r, sig, raw_args);
+            // printf("[eval] CMP node: op=%d a=", n->u.cmp.op);
+            // if (a.kind == VK_INT) printf("INT(%lld)", (long long)a.v.i);
+            // else if (a.kind == VK_FLOAT) printf("FLOAT(%f)", a.v.f);
+            // else if (a.kind == VK_STRING) printf("STRING(\"%s\")", a.v.s);
+            // else printf("INVALID");
+            // printf(" b=");
+            // if (b.kind == VK_INT) printf("INT(%lld)", (long long)b.v.i);
+            // else if (b.kind == VK_FLOAT) printf("FLOAT(%f)", b.v.f);
+            // else if (b.kind == VK_STRING) printf("STRING(\"%s\")", b.v.s);
+            // else printf("INVALID");
+            // printf("\n");
             return V_bool(cmp_values(n->u.cmp.op, a, b));
         }
 
@@ -979,7 +1346,7 @@ void demo_pipeline(const char *func_name)
 
 //     /* Just as a demo: print one known function */
 //     // print_function_by_name("update_tree");
-//     demo_pipeline("update_tree");
+//     demo_pipeline("price_out_impl");
 // }
 
 // /* Runs when the program exits */

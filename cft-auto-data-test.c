@@ -53,6 +53,7 @@ static trace_cpu_buffer_t  *trace_cpu_buffers = NULL;
 static int                  trace_n_cpus      = 0;
 
 /* ------------------------- trigger & probes ------------------------- */
+static _Thread_local uint64_t tls_raw_args[64];
 static TriggerDB trigger_db;
 
 typedef struct {
@@ -122,6 +123,7 @@ void probe2_set_disable_all(Probe2Set *set);
 bool mode_probe1_enabled = true;
 bool mode_probe2_enabled = true;
 static const size_t    target_func_max_bytes = 4096;   // how many bytes to scan if failed to get function size
+bool show_raw_args = false;
 
 static uintptr_t program_base(void); // early fwd so we can use it above
 
@@ -630,25 +632,25 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         }
         Probe2Set *p2set = &g_probe_list.probe_addrs[probe_index].p2set;
 
-        uint64_t *raw;
+        uint64_t *raw_args = tls_raw_args;
         const FuncSig *sig = trigger_db.entries[probe_index].sig;
-        extract_raw_args_sysv_x86_64(ctx, sig, raw);
+        extract_raw_args_sysv_x86_64(ctx, sig, raw_args);
 
-        int result = eval_compiled_trigger(&trigger_db.entries[probe_index].compiled, sig, raw);
+        int result = eval_compiled_trigger(&trigger_db.entries[probe_index].compiled, sig, raw_args);
 
-        //print raw args
-        printf("[probe1-%zu]: raw args: ", probe_index);
-        for (size_t i = 0; i < sig->n_args; ++i) {
-            printf("%" PRIu64 " ", raw[i]);
+        if (show_raw_args)
+        {
+            printf("[probe1-%zu]: raw args: ", probe_index);
+            for (size_t i = 0; i < sig->n_args; ++i) {
+                printf("%" PRIu64 " ", raw_args[i]);
+            }
+            printf("\n");
         }
-        printf("\n");
-        printf("[probe1-%zu]: eval trigger result: %d\n", probe_index, result);
+
+        if (result)
+            printf("[probe1-%zu]: eval triggered\n", probe_index);
         
-        // // in case non-pointer var used as pointer
-        // int value = *(int*)raw[0];
-        // printf("extracted value: %d\n", value);
-        
-        // result = 1; // for testing, always enable probe2
+        // // result = 1; // for testing, always enable probe2
         if (mode_probe2_enabled) {
             if (result) probe2_enable_all(p2set); else probe2_disable_all(p2set);
         }
@@ -663,7 +665,7 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         uint64_t d = rdtsc() - probe_time_t0;
         atomic_fetch_add_explicit(&g_probe_time_stats.total_cycles, d, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_probe_time_stats.calls, 1, memory_order_relaxed);
-        printf("[probe_time]: function took %llu cycles\n", (unsigned long long)d);
+        // printf("[probe_time]: function took %llu cycles\n", (unsigned long long)d);
     }
 }
 

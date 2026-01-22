@@ -1,4 +1,67 @@
+#define _GNU_SOURCE
 #include "trigger_check.h"
+
+#include <signal.h>
+#include <setjmp.h>
+#include <stdatomic.h>
+#include <unistd.h>
+
+#include <sys/uio.h>
+#include <unistd.h>
+#include <errno.h>
+
+static int safe_read_bytes(const void *addr, void *dst, size_t n)
+{
+    struct iovec local  = { .iov_base = dst,        .iov_len = n };
+    struct iovec remote = { .iov_base = (void*)addr, .iov_len = n };
+
+    ssize_t r = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (r < 0) return -errno;
+    if ((size_t)r != n) return -EIO;
+    return 0;
+}
+
+static int safe_read_ptr(const void *addr, void **out)
+{
+    return safe_read_bytes(addr, out, sizeof(void*));
+}
+
+static _Thread_local sigjmp_buf g_eval_jmp;
+static _Thread_local int g_eval_jmp_active = 0;
+
+static struct sigaction g_old_segv;
+static atomic_int g_segv_installed = 0;
+
+static void tc_segv_handler(int sig, siginfo_t *info, void *ucontext)
+{
+    (void)info; (void)ucontext;
+    if (g_eval_jmp_active) {
+        g_eval_jmp_active = 0;
+        siglongjmp(g_eval_jmp, 1);
+    }
+
+    /* Not ours: chain */
+    if (g_old_segv.sa_sigaction) {
+        g_old_segv.sa_sigaction(sig, info, ucontext);
+        return;
+    }
+    _exit(128 + sig);
+}
+
+static void tc_install_segv_once(void)
+{
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_segv_installed, &expected, 1)) return;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = tc_segv_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+
+    (void)sigaction(SIGSEGV, NULL, &g_old_segv);
+    (void)sigaction(SIGSEGV, &sa, NULL);
+}
 
 /* ---- helpers (same style as your code) ---- */
 
@@ -58,11 +121,17 @@ int extract_raw_args_sysv_x86_64(const struct patch_exec_context *ctx,
     const uint8_t *stackp = sp ? (sp + 8) : NULL;
     size_t stack_slots_used = 0;
 
+    if (!ctx->stack_pointer) return -10;
+    uintptr_t spv = (uintptr_t)ctx->stack_pointer;
+    /* alignment sanity: stack should be 8- or 16-byte aligned */
+    if ((spv & 0x7) != 0) return -11;
+
     /* Try to access SSE state for XMM regs (if libpatch saved it). */
     struct patch_x86_64_legacy *sse = NULL;
-    if (ctx->extended_states) { /* :contentReference[oaicite:4]{index=4} */
-        /* Provided by libpatch x86_64 header: returns PATCH_OK on success. */
-        (void)patch_x86_sse_state(ctx->extended_states, &sse);
+    if (ctx->extended_states) {
+        int rc = patch_x86_sse_state(ctx->extended_states, &sse);
+        if (rc != PATCH_OK) sse = NULL;
+        if (rc != PATCH_OK) printf("[warning] patch_x86_sse_state failed: %d\n", rc);
     }
 
     for (size_t a = 0; a < f->n_args; a++) {
@@ -73,27 +142,32 @@ int extract_raw_args_sysv_x86_64(const struct patch_exec_context *ctx,
 
         if (is_fp) {
             /* Prefer XMM0..XMM7 */
-            if (sse && fp_i < 8) {
-                /* In the legacy fxsave area, XMM regs are 128-bit; we read the low lane. */
-                const uint64_t *xmm_base = &sse->xmm0[0];   /* contiguous: xmm0..xmm15 */
-                const uint64_t lo64 = xmm_base[fp_i * 2 + 0];
+            // if (sse && fp_i < 8) {
+            //     /* In the legacy fxsave area, XMM regs are 128-bit; we read the low lane. */
+            //     const uint64_t *xmm_base = &sse->xmm0[0];   /* contiguous: xmm0..xmm15 */
+            //     const uint64_t lo64 = xmm_base[fp_i * 2 + 0];
 
-                if (vartype_is_float(t)) {
-                    /* float is low 32 bits of XMM */
-                    uint32_t lo32 = (uint32_t)(lo64 & 0xffffffffu);
-                    out_raw_args[a] = (uint64_t)lo32;
-                } else {
-                    /* double is low 64 bits of XMM */
-                    out_raw_args[a] = lo64;
-                }
-                fp_i++;
-                continue;
-            }
+            //     if (vartype_is_float(t)) {
+            //         /* float is low 32 bits of XMM */
+            //         uint32_t lo32 = (uint32_t)(lo64 & 0xffffffffu);
+            //         out_raw_args[a] = (uint64_t)lo32;
+            //     } else {
+            //         /* double is low 64 bits of XMM */
+            //         out_raw_args[a] = lo64;
+            //     }
+            //     fp_i++;
+            //     continue;
+            // }
 
             /* Spill to stack if no SSE saved or XMM regs exhausted */
             if (!stackp) return -2;
             uint64_t slot = 0;
-            memcpy(&slot, stackp + stack_slots_used * 8, 8);
+            // memcpy(&slot, stackp + stack_slots_used * 8, 8);
+            if (safe_read_bytes(stackp + stack_slots_used * 8, &slot, 8) != 0)
+            {
+                printf("[error] safe_read_bytes failed for FP arg spill at %p\n", stackp + stack_slots_used * 8);
+                return -4;
+            }
             out_raw_args[a] = slot;
             stack_slots_used++;
             continue;
@@ -101,7 +175,12 @@ int extract_raw_args_sysv_x86_64(const struct patch_exec_context *ctx,
 
         /* Integer/pointer class */
         if (int_i < 6) {
-            out_raw_args[a] = (uint64_t)ctx->general_purpose_registers[kIntRegs[int_i]]; /* :contentReference[oaicite:5]{index=5} */
+            uint64_t regv = 0;
+            if (safe_read_bytes(&ctx->general_purpose_registers[kIntRegs[int_i]], &regv, sizeof(regv)) != 0) {
+                printf("[error] safe_read_bytes failed for GPR reg index %d\n", kIntRegs[int_i]);
+                return -5;
+            }
+            out_raw_args[a] = regv;
             int_i++;
             continue;
         }
@@ -109,7 +188,12 @@ int extract_raw_args_sysv_x86_64(const struct patch_exec_context *ctx,
         /* Spill to stack */
         if (!stackp) return -3;
         uint64_t slot = 0;
-        memcpy(&slot, stackp + stack_slots_used * 8, 8);
+        // memcpy(&slot, stackp + stack_slots_used * 8, 8);
+        if (safe_read_bytes(stackp + stack_slots_used * 8, &slot, 8) != 0)
+        {
+            printf("[error] safe_read_bytes failed for integer arg spill at %p\n", stackp + stack_slots_used * 8);
+            return -4;
+        }
         out_raw_args[a] = slot;
         stack_slots_used++;
     }
@@ -123,7 +207,13 @@ static char *tc_strdup_local(const char *s) {
     size_t n = strlen(s);
     char *p = (char*)malloc(n + 1);
     if (!p) return NULL;
-    memcpy(p, s, n + 1);
+    // memcpy(p, s, n + 1);
+    if (safe_read_bytes(s, p, n + 1) != 0)
+    {
+        printf("[error] safe_read_bytes failed for strdup at %p\n", s);
+        free(p);
+        return NULL;
+    }
     return p;
 }
 
@@ -208,7 +298,7 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
 
         const FuncSig *sig = find_funcsig_by_name(db->model, t->trigger_func);
         if (!sig) {
-            printf("[warn] no FuncSig found for trigger function '%s'\n", t->trigger_func);
+            printf("[Error] no FuncSig found for trigger function '%s'\n", t->trigger_func);
         }
 
         for (size_t k = 0; k < t->triggers.n; k++) {
@@ -237,7 +327,7 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
                     e->compiled_ok = 1;
                 } else {
                     e->compiled_ok = 0;
-                    printf("[warn] failed to compile trigger[%zu] for %s: %s\n",
+                    printf("[Error] failed to compile trigger[%zu] for %s: %s\n",
                            k, t->trigger_func, t->triggers.items[k]);
                 }
             }
