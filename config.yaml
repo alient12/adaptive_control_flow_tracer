@@ -1,49 +1,49 @@
 TraceCondition:
   LogsDir: ./tracer_logs
   Targets:
-  # - Func: price_out_impl
-  #   Recursive: false
-  #   TriggerFunc: price_out_impl
-  #   Triggers:
-  #     - "arg0.feasible == 0"
-      # - arg0.feasible == 1836017711
-      # - arg0.nodes.orientation == 1
+  - Func: price_out_impl
+    Recursive: false
+    TriggerFunc: price_out_impl
+    Triggers:
+      - "arg0.feasible == 0"
+      - arg0.feasible == 1836017711
+      - arg0.nodes.orientation == 1
       # - auto arg0 arg2
-  # - Func: update_tree
-  #   Recursive: false
-  #   TriggerFunc: update_tree
-  #   Triggers:
-  #     # - arg0 == 10 && arg1 < 20
-  #     - arg5.orientation = 0 && arg5.child.orientation = 1
-  #     # - auto arg0 arg1
-  # - Func: write_objective_value
-  #   Recursive: false
-  #   TriggerFunc: write_objective_value
-  #   Triggers:
-  #     - arg0 == 'mcf.out'
-  # - Func: replace_weaker_arc
-  #   Recursive: false
-  #   TriggerFunc: replace_weaker_arc
-  #   Triggers:
-  #     - "arg2.depth = 3"
-  #     # - "arg0 == 0"
+  - Func: update_tree
+    Recursive: false
+    TriggerFunc: update_tree
+    Triggers:
+      # - arg0 == 10 && arg1 < 20
+      - arg5.orientation = 0 && arg5.child.orientation = 1
+      # - auto arg0 arg1
+  - Func: write_objective_value
+    Recursive: false
+    TriggerFunc: write_objective_value
+    Triggers:
+      - arg0 == 'mcf.out'
+  - Func: replace_weaker_arc
+    Recursive: false
+    TriggerFunc: replace_weaker_arc
+    Triggers:
+      - "arg2.depth = 3"
+      # - "arg0 == 0"
   
-  - Func: func_int
-    Recursive: false
-    TriggerFunc: func_int
-    Triggers:
-      # - arg0 == 4294967254
-      # - arg1 == 100000
-      - arg2 == 3.14
-      # - arg3 == 2.71828
-      # - arg4 == 65
-      # - arg5 == 7
-      # - arg6 == 123456
-  - Func: func_ptr
-    Recursive: false
-    TriggerFunc: func_ptr
-    Triggers:
-      - "arg0 == null"
-      - "*arg1 == 99"
-      # - "**arg2 == 99"
-      # - "arg3.a == 10"
+  # - Func: func_int
+  #   Recursive: false
+  #   TriggerFunc: func_int
+  #   Triggers:
+  #     # - arg0 == 4294967254
+  #     # - arg1 == 100000
+  #     - arg2 == 3.14
+  #     # - arg3 == 2.71828
+  #     # - arg4 == 65
+  #     # - arg5 == 7
+  #     # - arg6 == 123456
+  # - Func: func_ptr
+  #   Recursive: false
+  #   TriggerFunc: func_ptr
+  #   Triggers:
+  #     - "arg0 == null"
+  #     - "*arg1 == 99"
+  #     # - "**arg2 == 99"
+  #     # - "arg3.a == 10"

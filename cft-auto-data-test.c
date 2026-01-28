@@ -125,6 +125,7 @@ bool mode_probe2_enabled = true;
 static const size_t    target_func_max_bytes = 4096;   // how many bytes to scan if failed to get function size
 bool show_raw_args = false;
 bool debug_mode = false;
+bool show_probe_trigger_hits = false;
 
 static uintptr_t program_base(void); // early fwd so we can use it above
 
@@ -843,7 +844,7 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
             printf("\n");
         }
 
-        if (result)
+        if (show_probe_trigger_hits && result)
             printf("[probe1-%zu]: eval triggered\n", probe_index);
         
         // // result = 1; // for testing, always enable probe2
@@ -912,6 +913,95 @@ void print_test_summary(void) {
         }
         fclose(f);
     }
+}
+
+static void dcft_print_banner(void)
+{
+    fprintf(stderr,
+        "\n"
+        "=====================================================================\n"
+        "  Dynamic Control Flow Tracer (DCFT)\n"
+        "  Architecture-Independent Runtime Instrumentation\n"
+        "=====================================================================\n"
+        "\n"
+        "██████╗  ██████╗ ███████╗████████╗\n"
+        "██╔══██╗██╔════╝ ██╔════╝╚══██╔══╝\n"
+        "██║  ██║██║      █████╗     ██║   \n"
+        "██║  ██║██║      ██╔══╝     ██║   \n"
+        "██████╔╝╚██████╗ ██║        ██║   \n"
+        "╚═════╝  ╚═════╝ ╚═╝        ╚═╝   \n"
+        "\n"
+        "Dynamic Control Flow Tracer (DCFT)\n"
+        "Built on libpatch for adaptive runtime tracing\n"
+        "\n"
+        "Copyright (c) 2026 Ali Entezari\n"
+        "Polytechnique Montréal - DORSAL Lab - MOOSE Lab\n"
+        "All rights reserved.\n"
+        "\n"
+        "=====================================================================\n"
+        "\n");
+}
+
+static void dcft_print_banner_basilisk(void)
+{
+    fprintf(stderr,
+        "\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "  Dynamic Control Flow Tracer (DCFT)\n"
+        "  Architecture-Independent Runtime Instrumentation\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "\n"
+        "    ██████╗  █████╗ ███████╗██╗██╗     ██╗███████╗██╗  ██╗\n"
+        "    ██╔══██╗██╔══██╗██╔════╝██║██║     ██║██╔════╝██║ ██╔╝\n"
+        "    ██████╔╝███████║███████╗██║██║     ██║███████╗█████╔╝ \n"
+        "    ██╔══██╗██╔══██║╚════██║██║██║     ██║╚════██║██╔═██╗ \n"
+        "    ██████╔╝██║  ██║███████║██║███████╗██║███████║██║  ██╗\n"
+        "    ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝╚══════╝╚═╝╚══════╝╚═╝  ╚═╝\n"
+        "\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "  BASILISK — BASILISK Adaptively Samples Instruction-level\n"
+        "             Logic In Software Kontrol-flow\n"
+        "\n"
+        "  Dynamic Control-Flow Tracer\n"
+        "  Architecture-independent • Trigger-driven • Adaptive\n"
+        "  Built on libpatch for adaptive runtime tracing\n"
+        "\n"
+        "  Copyright (c) 2026 Ali Entezari\n"
+        "  Polytechnique Montréal - DORSAL Lab - MOOSE Lab\n"
+        "  All rights reserved.\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "\n");
+}
+
+static void dcft_print_banner_wyvern(void)
+{
+    fprintf(stderr,
+        "\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "  Dynamic Control Flow Tracer (DCFT)\n"
+        "  Architecture-Independent Runtime Instrumentation\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "\n"
+        "    ██╗    ██╗██╗   ██╗██╗   ██╗███████╗██████╗ ███╗   ██╗\n"
+        "    ██║    ██║╚██╗ ██╔╝██║   ██║██╔════╝██╔══██╗████╗  ██║\n"
+        "    ██║ █╗ ██║ ╚████╔╝ ██║   ██║█████╗  ██████╔╝██╔██╗ ██║\n"
+        "    ██║███╗██║  ╚██╔╝  ██║   ██║██╔══╝  ██╔══██╗██║╚██╗██║\n"
+        "    ╚███╔███╔╝   ██║   ╚██████╔╝███████╗██║  ██║██║ ╚████║\n"
+        "     ╚══╝╚══╝    ╚═╝    ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝\n"
+        "\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "  WYVERN — WYVERN Yields Verified Execution Route Networks\n"
+        "\n"
+        "\n"
+        "  Dynamic Control-Flow Tracer\n"
+        "  Architecture-independent • Trigger-driven • Adaptive\n"
+        "  Built on libpatch for adaptive runtime tracing\n"
+        "\n"
+        "  Copyright (c) 2026 Ali Entezari\n"
+        "  Polytechnique Montréal - DORSAL Lab - MOOSE Lab\n"
+        "  All rights reserved.\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "\n");
 }
 
 /* ------------------------- trace buffer management ------------------------- */
@@ -1049,7 +1139,8 @@ static inline void trace_record(uint64_t tsc, uint64_t value)
 
 __attribute__((constructor))
 static void preload_init(void) {
-    puts("libB (preloaded) initialising...");
+    dcft_print_banner_wyvern();
+    puts("DCFT (preloaded) initialising...");
 
     calibrate_tsc();
     const struct patch_option options[] = {
@@ -1112,21 +1203,21 @@ static void preload_init(void) {
     }
 
     uintptr_t addr = program_base();
-    printf("libB: main executable base address: 0x%" PRIxPTR "\n", addr);
+    printf("DCFT: main executable base address: 0x%" PRIxPTR "\n", addr);
 }
 
 /* ------------------------- destructor ------------------------- */
 
 __attribute__((destructor))
 static void preload_fini(void) {
-    puts("libB (preloaded) shutting down...");
+    puts("DCFT (preloaded) shutting down...");
 
     (void) patch_fini();
 
 	print_probe_time_summary();
     print_test_summary();
 
-    puts("libB cleanup complete.");
+    puts("DCFT cleanup complete.");
 }
 
 
