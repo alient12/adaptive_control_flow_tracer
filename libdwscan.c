@@ -898,15 +898,19 @@ static void walk_die_tree_collect_offsets(Dwarf_Die die, FuncOffTable *out, Dwar
     if (dwarf_tag(die, &tag, err) == DW_DLV_OK && tag == DW_TAG_subprogram) {
         char *nm = NULL;
         if (dwarf_diename(die, &nm, err) == DW_DLV_OK && nm && nm[0]) {
+
             uint64_t lowpc = 0, highpc = 0;
+
             int rc = die_lowpc_u64(die, &lowpc, err);
-            if (rc != DW_DLV_OK) return;
-
-            rc = die_highpc_u64(die, lowpc, &highpc, err);
-            if (rc != DW_DLV_OK) return;
-
-            uint64_t size = (highpc > lowpc) ? (highpc - lowpc) : 0;
-            (void)fotab_push(out, nm, lowpc, size);
+            if (rc == DW_DLV_OK) {
+                rc = die_highpc_u64(die, lowpc, &highpc, err);
+                if (rc == DW_DLV_OK) {
+                    uint64_t size = (highpc > lowpc) ? (highpc - lowpc) : 0;
+                    (void)fotab_push(out, nm, lowpc, size);
+                }
+                /* else: skip this DIE but keep walking */
+            }
+            /* else: skip this DIE but keep walking */
         }
     }
 
@@ -918,6 +922,7 @@ static void walk_die_tree_collect_offsets(Dwarf_Die die, FuncOffTable *out, Dwar
     Dwarf_Die sib = 0;
     int rc = dwarf_siblingof_c(die, &sib, err);
     dwarf_dealloc_die(die);
+
     if (rc == DW_DLV_OK) {
         walk_die_tree_collect_offsets(sib, out, err);
     }
@@ -1414,7 +1419,8 @@ void dwarf_model_free(DwarfModel *m)
 //                (unsigned long long)g_fotab.items[i].size);
 //     }
 
-//     print_function_by_name("price_out_impl");
+//     // print_function_by_name("price_out_impl");
+//     print_function_by_name("func_ptr");
 // }
 
 // __attribute__((destructor))
@@ -1455,4 +1461,5 @@ void dwarf_model_free(DwarfModel *m)
 
 // gcc -shared -fPIC libdwscan.c -o libdwscan.so -ldwarf -lz
 // LD_PRELOAD=./libdwscan.so ../new-libpatch/example-program
+// LD_PRELOAD=./libdwscan.so ./example-program
 // LD_PRELOAD=./libdwscan.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64

@@ -119,7 +119,6 @@ int resolve_member_path(void *base_addr,
 
         if (t && t->kind == VT_POINTER) {
             /* Follow pointer value stored at 'addr' */
-            // memcpy(&addr, addr, sizeof(void*));
             if (!addr) return -3;
             t = t->pointee;
         }
@@ -168,7 +167,14 @@ static int value_truthy(Value v)
 static int is_floatish_name(const char *n)
 {
     if (!n) return 0;
-    return (strcmp(n, "float") == 0 || strcmp(n, "double") == 0);
+    // return (strcmp(n, "float") == 0 || strcmp(n, "double") == 0);
+    return (strcmp(n, "float") == 0);
+}
+
+static int is_doubleish_name(const char *n)
+{
+    if (!n) return 0;
+    return (strcmp(n, "double") == 0);
 }
 
 static int is_cstring_ptr(const VarType *t)
@@ -475,6 +481,7 @@ static VarRef varref_from_tokens(const FuncSig *sig, const char *arg_ident, cons
         else {
             const VarType *bt = vt_unwrap(arg_type);
             if (bt && bt->kind == VT_BASE && is_floatish_name(bt->name)) r.hint_kind = VK_FLOAT;
+            else if (bt && bt->kind == VT_BASE && is_doubleish_name(bt->name)) r.hint_kind = VK_DOUBLE;
             else r.hint_kind = VK_INT;
         }
         r.final_type = arg_type;
@@ -496,6 +503,7 @@ static VarRef varref_from_tokens(const FuncSig *sig, const char *arg_ident, cons
     else {
         const VarType *bt = vt_unwrap(ft);
         if (bt && bt->kind == VT_BASE && is_floatish_name(bt->name)) r.hint_kind = VK_FLOAT;
+        else if (bt && bt->kind == VT_BASE && is_doubleish_name(bt->name)) r.hint_kind = VK_DOUBLE;
         else r.hint_kind = VK_INT;
     }
 
@@ -543,6 +551,7 @@ static int varref_append_index(VarRef *r, int idx)
     else {
         const VarType *bt = vt_unwrap(r->final_type);
         if (bt && bt->kind == VT_BASE && is_floatish_name(bt->name)) r->hint_kind = VK_FLOAT;
+        else if (bt && bt->kind == VT_BASE && is_doubleish_name(bt->name)) r->hint_kind = VK_DOUBLE;
         else r->hint_kind = VK_INT;
     }
 
@@ -575,6 +584,8 @@ static Value eval_varref(const VarRef *v, const FuncSig *sig, const uint64_t *ra
 {
     (void)sig;
     if (!v || !raw_args || v->arg_index < 0) return V_invalid();
+    printf("[eval] Evaluating varref: arg%d, n_steps=%lu, hint=%d, mode=%d, extra_deref=%u\n",
+           v->arg_index, v->n_steps, v->hint_kind, v->mode, v->extra_deref);
 
     uint64_t raw = raw_args[v->arg_index];
 
@@ -583,7 +594,86 @@ static Value eval_varref(const VarRef *v, const FuncSig *sig, const uint64_t *ra
     }
 
     if (!v->steps || v->n_steps == 0) {
-        if (v->hint_kind == VK_FLOAT) return V_float((double)(int64_t)raw);
+        double final_val = 0.0;
+        int is_floating_point = 0;
+
+        if (v->extra_deref) {
+            uint64_t addr = raw;
+            const VarType *t = v->final_type;
+
+            /* Each '*' requires that current type is pointer */
+            for (uint32_t d = 0; d < v->extra_deref; d++) {
+                t = vt_unwrap(t);
+                if (!t || t->kind != VT_POINTER) {
+                    printf("[error] extra deref on non-pointer type\n");
+                    return V_invalid();
+                }
+
+                const VarType *pointee = t->pointee;
+
+                if (d + 1 < v->extra_deref) {
+                    /* intermediate deref: chase pointer */
+                    void *next = NULL;
+                    if (safe_read_ptr((void*)addr, &next) != 0) {
+                        printf("[error] safe_read_ptr failed at %p\n", (void*)addr);
+                        return V_invalid();
+                    }
+                    addr = (uint64_t)(uintptr_t)next;
+                    if (!addr) return V_invalid();
+                } else {
+                    /* final deref: load scalar/struct value at addr with pointee type */
+                    Value out = V_invalid();
+                    ValueKind hk = VK_INT;
+
+                    const VarType *bt = vt_unwrap(pointee);
+                    if (bt && bt->kind == VT_BASE && is_floatish_name(bt->name)) hk = VK_FLOAT;
+                    else if (bt && bt->kind == VT_BASE && is_doubleish_name(bt->name)) hk = VK_DOUBLE;
+
+                    if (read_scalar_value((void*)addr, pointee, hk, &out) != 0) {
+                        printf("[error] read_scalar_value failed at %p\n", (void*)addr);
+                        return V_invalid();
+                    }
+                    return out;
+                }
+
+                t = pointee;
+            }
+
+            return V_invalid(); /* shouldn't reach */
+        }
+
+        if (v->hint_kind == VK_FLOAT) {
+            /* Case 1: 32-bit Float */
+            /* Take the lower 32 bits of the 64-bit register */
+            uint32_t bits = (uint32_t)raw; 
+            float f_temp;
+            
+            /* Reinterpret bits as float */
+            if (safe_read_bytes(&bits, &f_temp, sizeof(f_temp)) != 0)
+            {
+                printf("[error] safe_read_bytes failed for float reinterpret at %p\n", (void*)&bits);
+                return V_invalid();
+            }
+            
+            /* Promote to double for V_float */
+            final_val = (double)f_temp; 
+            is_floating_point = 1;
+        } 
+        else if (v->hint_kind == VK_DOUBLE) { 
+            /* Case 2: 64-bit Double */
+            /* Reinterpret the full 64-bit register as double */
+            if (safe_read_bytes(&raw, &final_val, sizeof(final_val)) != 0)
+            {
+                printf("[error] safe_read_bytes failed for double reinterpret at %p\n", (void*)&raw);
+                return V_invalid();
+            }
+            is_floating_point = 1;
+        }
+        
+        if (is_floating_point) {
+            return V_float(final_val);
+        }
+
         return V_int((int64_t)raw);
     }
 
@@ -895,6 +985,9 @@ static Node *parse_ast_primary(CParser *P)
 
     Token t = P->L.cur;
 
+    printf("[parse] primary token kind=%d deref_count=%d saw_addr=%d\n",
+           t.kind, deref_count, saw_addr);
+
     if (t.kind == TK_NUMBER) {
         /* Disallow prefix ops on non-lvalues in your minimal language */
         if (saw_addr || deref_count) return NULL;
@@ -927,6 +1020,17 @@ static Node *parse_ast_primary(CParser *P)
     }
 
     if (t.kind == TK_IDENT) {
+        /* Support NULL literal */
+        if (strcmp(t.text, "NULL") == 0 || strcmp(t.text, "null") == 0) {
+            if (saw_addr || deref_count) return NULL;  /* keep your rule */
+            Node *n = node_new(N_CONST);
+            if (!n) return NULL;
+            n->u.cval = V_int(0);
+            lex_next(&P->L);
+            return n;
+        }
+
+        /* parse args and member paths */
         char arg_ident[256];
         strncpy(arg_ident, t.text, sizeof(arg_ident));
         arg_ident[sizeof(arg_ident)-1] = 0;
@@ -1095,9 +1199,23 @@ static int cmp_values(CmpOp op, Value a, Value b)
         return 0;
     }
 
-    if (a.kind == VK_FLOAT || b.kind == VK_FLOAT) {
-        double x = (a.kind == VK_FLOAT) ? a.v.f : (double)a.v.i;
-        double y = (b.kind == VK_FLOAT) ? b.v.f : (double)b.v.i;
+    if (a.kind == VK_FLOAT && b.kind == VK_FLOAT) {
+        float x = (a.kind == VK_FLOAT) ? (float)a.v.f : (float)a.v.i;
+        float y = (b.kind == VK_FLOAT) ? (float)b.v.f : (float)b.v.i;
+        switch (op) {
+            case OP_EQ: return x == y;
+            case OP_NE: return x != y;
+            case OP_LT: return x <  y;
+            case OP_LE: return x <= y;
+            case OP_GT: return x >  y;
+            case OP_GE: return x >= y;
+        }
+        return 0;
+    }
+    
+    if (a.kind == VK_DOUBLE || b.kind == VK_DOUBLE) {
+        double x = (a.kind == VK_DOUBLE) ? (double)a.v.f : (double)a.v.i;
+        double y = (b.kind == VK_DOUBLE) ? (double)b.v.f : (double)b.v.i;
         switch (op) {
             case OP_EQ: return x == y;
             case OP_NE: return x != y;
@@ -1136,17 +1254,17 @@ static Value eval_node(const Node *n, const FuncSig *sig, const uint64_t *raw_ar
         case N_CMP: {
             Value a = eval_node(n->u.cmp.l, sig, raw_args);
             Value b = eval_node(n->u.cmp.r, sig, raw_args);
-            // printf("[eval] CMP node: op=%d a=", n->u.cmp.op);
-            // if (a.kind == VK_INT) printf("INT(%lld)", (long long)a.v.i);
-            // else if (a.kind == VK_FLOAT) printf("FLOAT(%f)", a.v.f);
-            // else if (a.kind == VK_STRING) printf("STRING(\"%s\")", a.v.s);
-            // else printf("INVALID");
-            // printf(" b=");
-            // if (b.kind == VK_INT) printf("INT(%lld)", (long long)b.v.i);
-            // else if (b.kind == VK_FLOAT) printf("FLOAT(%f)", b.v.f);
-            // else if (b.kind == VK_STRING) printf("STRING(\"%s\")", b.v.s);
-            // else printf("INVALID");
-            // printf("\n");
+            printf("[eval] CMP node: op=%d a=", n->u.cmp.op);
+            if (a.kind == VK_INT) printf("INT(%lld)", (long long)a.v.i);
+            else if (a.kind == VK_FLOAT) printf("FLOAT(%f)", a.v.f);
+            else if (a.kind == VK_STRING) printf("STRING(\"%s\")", a.v.s);
+            else printf("INVALID");
+            printf(" b=");
+            if (b.kind == VK_INT) printf("INT(%lld)", (long long)b.v.i);
+            else if (b.kind == VK_FLOAT) printf("FLOAT(%f)", b.v.f);
+            else if (b.kind == VK_STRING) printf("STRING(\"%s\")", b.v.s);
+            else printf("INVALID");
+            printf("\n");
             return V_bool(cmp_values(n->u.cmp.op, a, b));
         }
 

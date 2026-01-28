@@ -36,6 +36,7 @@ extern "C" {
 typedef enum {
     VK_INT,
     VK_FLOAT,
+    VK_DOUBLE,
     VK_STRING,
     VK_BOOL,
     VK_INVALID

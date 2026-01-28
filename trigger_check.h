@@ -21,37 +21,42 @@ int extract_raw_args_sysv_x86_64(const struct patch_exec_context *ctx, const Fun
 
 /* ---------------- Trigger database ---------------- */
 typedef struct TriggerEntry {
-    /* identity */
-    size_t      index;         /* 0..n_entries-1 */
-    size_t      target_i;      /* cfg target index */
-    size_t      trigger_i;     /* trigger index within target */
+    size_t          index;         /* Unique global index (optional) */
+    size_t          trigger_i;     /* Index within the config list */
 
-    /* target function */
+    /* Specific trigger logic */
+    char           *trigger_expr;
+    CompiledTrigger compiled;      /* Owned by this entry */
+    int             compiled_ok;   /* 1 if compile_trigger succeeded */
+} TriggerEntry;
+
+typedef struct GroupTriggerEntry {
+    size_t      target_i;
+
+    /* Target Metadata (Shared by all entries in this group) */
     char       *func_name;
     uint64_t    func_lowpc;
     uint64_t    func_size;
 
-    /* trigger function (the function whose args are used in trigger expr) */
     char       *trigger_func_name;
     uint64_t    trigger_func_lowpc;
     uint64_t    trigger_func_size;
 
-    /* config */
     int         recursive;
+    const FuncSig *sig;            /* Common signature for the trigger function */
 
-    /* trigger */
-    char       *trigger_expr;
-    const FuncSig *sig;        /* owned by DwarfModel; valid while model lives */
-    CompiledTrigger compiled;  /* owned by this entry; must be freed */
-    int         compiled_ok;   /* 1 if compile_trigger succeeded */
-} TriggerEntry;
+    /* The grouped triggers */
+    TriggerEntry *entries;
+    size_t        n_entries;
+} GroupTriggerEntry;
 
 typedef struct TriggerDB {
-    DwarfModel     *model;      /* owns FuncSig pointers */
-    TraceConditionCfg cfg;      /* we keep a copy alive (so t->func strings remain valid if you want) */
+    DwarfModel        *model;
+    TraceConditionCfg  cfg;
 
-    TriggerEntry   *entries;
-    size_t          n_entries;
+    /* Array of Groups instead of flat entries */
+    GroupTriggerEntry *groups;
+    size_t             n_groups;
 } TriggerDB;
 
 int triggerdb_setup(TriggerDB *db, const char *cfg_path);

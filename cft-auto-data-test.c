@@ -632,11 +632,26 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         }
         Probe2Set *p2set = &g_probe_list.probe_addrs[probe_index].p2set;
 
-        uint64_t *raw_args = tls_raw_args;
-        const FuncSig *sig = trigger_db.entries[probe_index].sig;
-        extract_raw_args_sysv_x86_64(ctx, sig, raw_args);
+        GroupTriggerEntry *group = &trigger_db.groups[probe_index];
 
-        int result = eval_compiled_trigger(&trigger_db.entries[probe_index].compiled, sig, raw_args);
+        // Extract args ONCE for the whole group (Optimization)
+        uint64_t *raw_args = tls_raw_args;
+        const FuncSig *sig = group->sig;
+        int result = 0;
+
+        if (sig) {
+            extract_raw_args_sysv_x86_64(ctx, sig, raw_args);
+
+            // Iterate through all triggers in this group
+            for (size_t k = 0; k < group->n_entries; k++) {
+                TriggerEntry *entry = &group->entries[k];
+
+                if (entry->compiled_ok) {
+                    result = eval_compiled_trigger(&entry->compiled, sig, raw_args);
+                    if (result) break; // short-circuit on first match
+                }
+            }
+        }
 
         if (show_raw_args)
         {
@@ -864,37 +879,46 @@ static void preload_init(void) {
     triggerdb_setup(&trigger_db, "config.yaml");
     trace_buffers_init();
 
-    for (size_t i = 0; i < trigger_db.n_entries; ++i) {
-        if (trigger_db.entries[i].func_size > 0) {
-            uintptr_t target_lowpc    = trigger_db.entries[i].func_lowpc;
-            uintptr_t trigger_lowpc = trigger_db.entries[i].trigger_func_lowpc;
-            char *target_name = trigger_db.entries[i].func_name;
-            uint64_t target_size = trigger_db.entries[i].func_size > 0 ? trigger_db.entries[i].func_size : target_func_max_bytes;
+    /* Iterate over Groups instead of Entries */
+    for (size_t i = 0; i < trigger_db.n_groups; ++i) {
+        GroupTriggerEntry *group = &trigger_db.groups[i];
 
-            // check if name already in the list
+        /* Use group metadata */
+        if (group->func_size > 0) {
+            uintptr_t target_lowpc    = group->func_lowpc;
+            uintptr_t trigger_lowpc   = group->trigger_func_lowpc;
+            char *target_name         = group->func_name;
+            uint64_t target_size      = group->func_size > 0 ? group->func_size : target_func_max_bytes;
+
+            /* Optional: Check if name already in the list (in case config has duplicate targets) */
+            int found = 0;
             for (size_t j = 0; j < g_probe_list.n_probes; ++j) {
                 if (strcmp(g_probe_list.probe_addrs[j].target_name, target_name) == 0) {
-                    // already exists
-                    target_lowpc = 0;
-                    trigger_lowpc = 0;
+                    found = 1;
                     break;
                 }
             }
-            if (target_lowpc == 0 || trigger_lowpc == 0) continue;
+            if (found) continue;
 
-            g_probe_list.probe_addrs = (ProbeID*)realloc(g_probe_list.probe_addrs,
-                                                             (g_probe_list.n_probes + 1) * sizeof(ProbeID));
-            if (!g_probe_list.probe_addrs) {
+            /* Expand the probe list */
+            ProbeID *new_list = (ProbeID*)realloc(g_probe_list.probe_addrs,
+                                                  (g_probe_list.n_probes + 1) * sizeof(ProbeID));
+            if (!new_list) {
                 fprintf(stderr, "[probe2-config] failed to realloc probe addrs\n");
                 return;
             }
+            g_probe_list.probe_addrs = new_list;
+
+            /* Register the probe using Group data */
+            ProbeID *p = &g_probe_list.probe_addrs[g_probe_list.n_probes];
             
-            g_probe_list.probe_addrs[g_probe_list.n_probes].target_addr  = program_base() + target_lowpc;
-            g_probe_list.probe_addrs[g_probe_list.n_probes].trigger_addr = program_base() + trigger_lowpc;
-            g_probe_list.probe_addrs[g_probe_list.n_probes].target_name = target_name;
-            g_probe_list.probe_addrs[g_probe_list.n_probes].target_size = target_size;
-            g_probe_list.probe_addrs[g_probe_list.n_probes].p2set = (Probe2Set){0};
-            g_probe_list.probe_addrs[g_probe_list.n_probes].index = i;
+            p->target_addr  = program_base() + target_lowpc;
+            p->trigger_addr = program_base() + trigger_lowpc;
+            p->target_name  = target_name;
+            p->target_size  = target_size;
+            p->p2set        = (Probe2Set){0};
+            p->index        = i; /* Store the GROUP index here, not the entry index */
+            
             g_probe_list.n_probes++;
         }
     }

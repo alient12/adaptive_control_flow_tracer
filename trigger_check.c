@@ -142,22 +142,28 @@ int extract_raw_args_sysv_x86_64(const struct patch_exec_context *ctx,
 
         if (is_fp) {
             /* Prefer XMM0..XMM7 */
-            // if (sse && fp_i < 8) {
-            //     /* In the legacy fxsave area, XMM regs are 128-bit; we read the low lane. */
-            //     const uint64_t *xmm_base = &sse->xmm0[0];   /* contiguous: xmm0..xmm15 */
-            //     const uint64_t lo64 = xmm_base[fp_i * 2 + 0];
+            if (sse && fp_i < 8) {
+                /* In the legacy fxsave area, XMM regs are 128-bit; we read the low lane. */
+                uint64_t lo64;
 
-            //     if (vartype_is_float(t)) {
-            //         /* float is low 32 bits of XMM */
-            //         uint32_t lo32 = (uint32_t)(lo64 & 0xffffffffu);
-            //         out_raw_args[a] = (uint64_t)lo32;
-            //     } else {
-            //         /* double is low 64 bits of XMM */
-            //         out_raw_args[a] = lo64;
-            //     }
-            //     fp_i++;
-            //     continue;
-            // }
+                const void *src_ptr = (const char *)&sse->xmm0[0] + (fp_i * 2 * sizeof(uint64_t));
+                if (safe_read_bytes(src_ptr, &lo64, sizeof(lo64)) != 0)
+                {
+                    printf("[error] safe_read_bytes failed for XMM%zu read at %p\n", fp_i, src_ptr);
+                    return -6;
+                }
+
+                if (vartype_is_float(t)) {
+                    /* float is low 32 bits of XMM */
+                    uint32_t lo32 = (uint32_t)(lo64 & 0xffffffffu);
+                    out_raw_args[a] = (uint64_t)lo32;
+                } else {
+                    /* double is low 64 bits of XMM */
+                    out_raw_args[a] = lo64;
+                }
+                fp_i++;
+                continue;
+            }
 
             /* Spill to stack if no SSE saved or XMM regs exhausted */
             if (!stackp) return -2;
@@ -221,15 +227,29 @@ static void triggerdb_free(TriggerDB *db)
 {
     if (!db) return;
 
-    if (db->entries) {
-        for (size_t i = 0; i < db->n_entries; i++) {
-            TriggerEntry *e = &db->entries[i];
-            if (e->compiled_ok) compiled_trigger_free(&e->compiled);
-            free(e->func_name);
-            free(e->trigger_func_name);
-            free(e->trigger_expr);
+    if (db->groups) {
+        for (size_t i = 0; i < db->n_groups; i++) {
+            GroupTriggerEntry *group = &db->groups[i];
+
+            /* 1. Free Group Metadata (Shared strings) */
+            free(group->func_name);
+            free(group->trigger_func_name);
+
+            /* 2. Free Entries within the Group */
+            if (group->entries) {
+                for (size_t j = 0; j < group->n_entries; j++) {
+                    TriggerEntry *e = &group->entries[j];
+                    
+                    if (e->compiled_ok) {
+                        compiled_trigger_free(&e->compiled);
+                    }
+                    free(e->trigger_expr);
+                }
+                free(group->entries);
+            }
         }
-        free(db->entries);
+        /* 3. Free the Groups array itself */
+        free(db->groups);
     }
 
     /* cfg_free frees heap allocations inside cfg */
@@ -268,20 +288,21 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
         total += db->cfg.targets[i].triggers.n;
     }
 
-    db->n_entries = total;
-    db->entries = (TriggerEntry*)calloc(total ? total : 1, sizeof(TriggerEntry));
-    if (!db->entries && total) {
-        triggerdb_free(db);
-        return -4;
+    /* Allocate the groups array in the DB first */
+    db->n_groups = db->cfg.n_targets;
+    db->groups = calloc(db->n_groups, sizeof(GroupTriggerEntry));
+    if (!db->groups) {
+        /* Handle allocation error */
+        return -1; 
     }
 
-    dwarf_build_function_offset_table();
-    dwarf_update_function_offset_table_from_elf(1);
+    size_t global_idx = 0; // Keep a running count if you still need unique IDs
 
-    /* Fill entries */
-    size_t idx = 0;
     for (size_t ti = 0; ti < db->cfg.n_targets; ti++) {
         const TargetCfg *t = &db->cfg.targets[ti];
+        
+        /* Point to the current group in the DB */
+        GroupTriggerEntry *group = &db->groups[ti];
 
         uint64_t func_off = 0, func_size = 0;
         uint64_t trig_off = 0, trig_size = 0;
@@ -289,38 +310,44 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
         (void)dwarf_find_function_lowpc(t->func, &func_off, &func_size);
         (void)dwarf_find_function_lowpc(t->trigger_func, &trig_off, &trig_size);
 
-        printf("[triggerdb-setup] Target %zu: Func=%s, Offset=0x%lx, Size=0x%lx, Recursive=%d, TriggerFunc=%s, TriggerOffset=0x%lx, TriggerSize=0x%lx, Triggers=[",
-               ti, t->func, func_off, func_size, t->recursive, t->trigger_func, trig_off, trig_size);
-        for (size_t j = 0; j < t->triggers.n; j++) {
-            printf("%s\"%s\"", (j > 0) ? ", " : "", t->triggers.items[j]);
-        }
-        printf("]\n");
+        /* Debug Print */
+        printf("[triggerdb-setup] Target %zu: Func=%s, Offset=0x%lx, ...\n", 
+               ti, t->func, func_off); // (Abbreviated for brevity)
 
+        /* 1. Fill Group Metadata (Common info) */
+        group->target_i = ti;
+        
+        group->func_name  = tc_strdup_local(t->func);
+        group->func_lowpc = func_off;
+        group->func_size  = func_size;
+
+        group->trigger_func_name  = tc_strdup_local(t->trigger_func);
+        group->trigger_func_lowpc = trig_off;
+        group->trigger_func_size  = trig_size;
+
+        group->recursive = t->recursive;
+
+        /* Find FuncSig once per group */
         const FuncSig *sig = find_funcsig_by_name(db->model, t->trigger_func);
+        group->sig = sig;
+
         if (!sig) {
             printf("[Error] no FuncSig found for trigger function '%s'\n", t->trigger_func);
         }
 
+        /* 2. Allocate Entries for this Group */
+        group->n_entries = t->triggers.n;
+        if (group->n_entries > 0) {
+            group->entries = calloc(group->n_entries, sizeof(TriggerEntry));
+        }
+
+        /* 3. Fill individual Trigger Entries */
         for (size_t k = 0; k < t->triggers.n; k++) {
-            TriggerEntry *e = &db->entries[idx];
-            memset(e, 0, sizeof(*e));
-
-            e->index      = idx;
-            e->target_i   = ti;
-            e->trigger_i  = k;
-
-            e->func_name  = tc_strdup_local(t->func);
-            e->func_lowpc = func_off;
-            e->func_size  = func_size;
-
-            e->trigger_func_name  = tc_strdup_local(t->trigger_func);
-            e->trigger_func_lowpc = trig_off;
-            e->trigger_func_size  = trig_size;
-
-            e->recursive  = t->recursive;
-
+            TriggerEntry *e = &group->entries[k];
+            
+            e->index     = global_idx++;
+            e->trigger_i = k;
             e->trigger_expr = tc_strdup_local(t->triggers.items[k]);
-            e->sig = (const FuncSig *)sig;
 
             if (sig) {
                 if (compile_trigger(&e->compiled, t->triggers.items[k], sig) == 0) {
@@ -331,8 +358,6 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
                            k, t->trigger_func, t->triggers.items[k]);
                 }
             }
-
-            idx++;
         }
     }
 
@@ -341,68 +366,120 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
 
 static inline const TriggerEntry *triggerdb_get(const TriggerDB *db, size_t index)
 {
-    if (!db || !db->entries || index >= db->n_entries) return NULL;
-    return &db->entries[index];
+    if (!db || !db->groups) return NULL;
+
+    size_t current_idx = index;
+
+    for (size_t i = 0; i < db->n_groups; i++) {
+        GroupTriggerEntry *group = &db->groups[i];
+        
+        /* If the index is within this group, return the entry */
+        if (current_idx < group->n_entries) {
+            return &group->entries[current_idx];
+        }
+
+        /* Otherwise, subtract this group's count and continue */
+        current_idx -= group->n_entries;
+    }
+
+    return NULL; /* Index out of bounds */
 }
 
 void demo()
 {
+    /* 1. Initialization */
     DwarfModel *model = dwarf_scan_collect_model();
     if (!model) {
-        printf("[error] failed to build DWARF model. make sure the target is compiled with debug info\n");
+        printf("[error] failed to build DWARF model\n");
         return;
     }
 
-    TraceConditionCfg cfg;
+    TriggerDB db;
+    memset(&db, 0, sizeof(db));
+    db.model = model;
+
     const char *cfg_path = getenv("TRACE_CONFIG");
     if (!cfg_path) cfg_path = "config.yaml";
-    if (load_trace_config(cfg_path, &cfg) != 0) {
+    
+    if (load_trace_config(cfg_path, &db.cfg) != 0) {
         printf("failed to load %s\n", cfg_path);
         dwarf_model_free(model);
         return;
     }
 
-    // for each target in cfg, print its function name and triggers
-    for (size_t i = 0; i < cfg.n_targets; i++) {
-        const TargetCfg *t = &cfg.targets[i];
+    dwarf_build_function_offset_table();
+    dwarf_update_function_offset_table_from_elf(/*include_plt=*/1);
 
-        dwarf_build_function_offset_table();
-        dwarf_update_function_offset_table_from_elf(/*include_plt=*/1);
+    /* 2. Build the DB (using the logic from the previous step) */
+    /* Note: In a real app, this would be a function like triggerdb_build(&db); */
+    /* We include the allocation logic here for the demo context. */
+    
+    db.n_groups = db.cfg.n_targets;
+    db.groups = calloc(db.n_groups, sizeof(GroupTriggerEntry));
+    size_t global_idx = 0;
+
+    printf("[demo] Building TriggerDB with Group Access...\n");
+
+    for (size_t i = 0; i < db.cfg.n_targets; i++) {
+        const TargetCfg *t = &db.cfg.targets[i];
+        GroupTriggerEntry *group = &db.groups[i];
+
+        // --- Fill Group Metadata ---
+        group->target_i = i;
+        group->func_name = tc_strdup_local(t->func);
+        group->trigger_func_name = tc_strdup_local(t->trigger_func);
+        group->recursive = t->recursive;
+        group->sig = find_funcsig_by_name(db.model, t->trigger_func);
         
-        uint64_t offset, trigger_offset;
-        uint64_t size, trigger_size;
-        dwarf_find_function_lowpc(t->func, &offset, &size);
-        dwarf_find_function_lowpc(t->trigger_func, &trigger_offset, &trigger_size);
-        
-        printf("Target %zu: Func=%s, Offset=0x%lx, Size=0x%lx, Recursive=%d, TriggerFunc=%s, TriggerOffset=0x%lx, TriggerSize=0x%lx, Triggers=[", i, t->func, offset, size, t->recursive, t->trigger_func, trigger_offset, trigger_size);
-        for (size_t j = 0; j < t->triggers.n; j++) {
-            printf("%s\"%s\"", (j > 0) ? ", " : "", t->triggers.items[j]);
-        }
-        printf("]\n");
+        dwarf_find_function_lowpc(t->func, &group->func_lowpc, &group->func_size);
+        dwarf_find_function_lowpc(t->trigger_func, &group->trigger_func_lowpc, &group->trigger_func_size);
 
-        const FuncSig *f = find_funcsig_by_name(model, t->trigger_func);
-        printf("found function %s with %zu args\n", f->name, f->n_args);
-
-        printf("[demo] loaded %zu trigger(s) for %s\n", t->triggers.n, t->trigger_func);
-
-        CompiledTrigger *compiled = NULL;
-        if (t->triggers.n) {
-            compiled = (CompiledTrigger*)calloc(t->triggers.n, sizeof(CompiledTrigger));
-            for (size_t k = 0; k < t->triggers.n; k++) {
-                if (compile_trigger(&compiled[k], t->triggers.items[k], f) != 0) {
-                    printf("failed to compile trigger[%zu]: %s\n", k, t->triggers.items[k]);
+        // --- Fill Entries ---
+        group->n_entries = t->triggers.n;
+        if (group->n_entries > 0) {
+            group->entries = calloc(group->n_entries, sizeof(TriggerEntry));
+            
+            for (size_t k = 0; k < group->n_entries; k++) {
+                TriggerEntry *e = &group->entries[k];
+                e->index = global_idx++; /* Unique global ID */
+                e->trigger_i = k;
+                e->trigger_expr = tc_strdup_local(t->triggers.items[k]);
+                
+                if (group->sig) {
+                    if (compile_trigger(&e->compiled, e->trigger_expr, group->sig) == 0) {
+                        e->compiled_ok = 1;
+                    } else {
+                        printf("[Error] Compile failed: %s\n", e->trigger_expr);
+                    }
                 }
             }
         }
-        
-        if (compiled) {
-            for (size_t k = 0; k < t->triggers.n; k++) compiled_trigger_free(&compiled[k]);
-            free(compiled);
-        }
     }
 
+    /* 3. Demonstrate Access by Group */
+    printf("\n[demo] Iterating DB by Group:\n");
+    printf("========================================\n");
 
-    cfg_free(&cfg);
+    for (size_t i = 0; i < db.n_groups; i++) {
+        const GroupTriggerEntry *g = &db.groups[i];
+
+        printf("Group %zu: Target='%s' (0x%lx), TriggerFunc='%s' (0x%lx)\n", 
+               i, g->func_name, g->func_lowpc, 
+               g->trigger_func_name, g->trigger_func_lowpc);
+        
+        printf("  |-- Contains %zu trigger(s):\n", g->n_entries);
+        
+        for (size_t j = 0; j < g->n_entries; j++) {
+            const TriggerEntry *e = &g->entries[j];
+            printf("      [%zu] GlobalID=%zu: \"%s\" (Compiled: %s)\n", 
+                   j, e->index, e->trigger_expr, e->compiled_ok ? "Yes" : "No");
+        }
+        printf("\n");
+    }
+
+    /* 4. Cleanup */
+    // (Add appropriate cleanup for db.groups, db.entries, strings, etc.)
+    cfg_free(&db.cfg);
     dwarf_model_free(model);
 }
 
