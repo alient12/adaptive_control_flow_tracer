@@ -416,16 +416,12 @@ static int find_function_jumps(const void *func_addr,
                 if (!js.is_ret && !js.is_call) {         // <- keep only Jumps
                     sites[w++] = js;
                 }
-                if (insn[i].id == X86_INS_RET || insn[i].id == X86_INS_RETF)
-                    break;                // stop scanning at function return
             }
         } else {
             if (classify_x86_branch(&insn[i], &js)) {
                 if (!js.is_ret && !js.is_call) {         // <- keep only Jumps
                     sites[w++] = js;
                 }
-                if (insn[i].id == X86_INS_RET || insn[i].id == X86_INS_RETF)
-                    break;                // stop scanning at function return
             }
         }
     }
