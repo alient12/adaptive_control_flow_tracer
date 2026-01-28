@@ -584,8 +584,6 @@ static Value eval_varref(const VarRef *v, const FuncSig *sig, const uint64_t *ra
 {
     (void)sig;
     if (!v || !raw_args || v->arg_index < 0) return V_invalid();
-    printf("[eval] Evaluating varref: arg%d, n_steps=%lu, hint=%d, mode=%d, extra_deref=%u\n",
-           v->arg_index, v->n_steps, v->hint_kind, v->mode, v->extra_deref);
 
     uint64_t raw = raw_args[v->arg_index];
 
@@ -985,9 +983,6 @@ static Node *parse_ast_primary(CParser *P)
 
     Token t = P->L.cur;
 
-    printf("[parse] primary token kind=%d deref_count=%d saw_addr=%d\n",
-           t.kind, deref_count, saw_addr);
-
     if (t.kind == TK_NUMBER) {
         /* Disallow prefix ops on non-lvalues in your minimal language */
         if (saw_addr || deref_count) return NULL;
@@ -1254,17 +1249,17 @@ static Value eval_node(const Node *n, const FuncSig *sig, const uint64_t *raw_ar
         case N_CMP: {
             Value a = eval_node(n->u.cmp.l, sig, raw_args);
             Value b = eval_node(n->u.cmp.r, sig, raw_args);
-            printf("[eval] CMP node: op=%d a=", n->u.cmp.op);
-            if (a.kind == VK_INT) printf("INT(%lld)", (long long)a.v.i);
-            else if (a.kind == VK_FLOAT) printf("FLOAT(%f)", a.v.f);
-            else if (a.kind == VK_STRING) printf("STRING(\"%s\")", a.v.s);
-            else printf("INVALID");
-            printf(" b=");
-            if (b.kind == VK_INT) printf("INT(%lld)", (long long)b.v.i);
-            else if (b.kind == VK_FLOAT) printf("FLOAT(%f)", b.v.f);
-            else if (b.kind == VK_STRING) printf("STRING(\"%s\")", b.v.s);
-            else printf("INVALID");
-            printf("\n");
+            // printf("[eval] CMP node: op=%d a=", n->u.cmp.op);
+            // if (a.kind == VK_INT) printf("INT(%lld)", (long long)a.v.i);
+            // else if (a.kind == VK_FLOAT) printf("FLOAT(%f)", a.v.f);
+            // else if (a.kind == VK_STRING) printf("STRING(\"%s\")", a.v.s);
+            // else printf("INVALID");
+            // printf(" b=");
+            // if (b.kind == VK_INT) printf("INT(%lld)", (long long)b.v.i);
+            // else if (b.kind == VK_FLOAT) printf("FLOAT(%f)", b.v.f);
+            // else if (b.kind == VK_STRING) printf("STRING(\"%s\")", b.v.s);
+            // else printf("INVALID");
+            // printf("\n");
             return V_bool(cmp_values(n->u.cmp.op, a, b));
         }
 

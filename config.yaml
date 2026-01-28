@@ -28,17 +28,17 @@ TraceCondition:
   #     - "arg2.depth = 3"
   #     # - "arg0 == 0"
   
-  # - Func: func_int
-  #   Recursive: false
-  #   TriggerFunc: func_int
-  #   Triggers:
-  #     # - arg0 == 4294967254
-  #     # - arg1 == 100000
-  #     - arg2 == 3.14
-  #     # - arg3 == 2.71828
-  #     # - arg4 == 65
-  #     # - arg5 == 7
-  #     # - arg6 == 123456
+  - Func: func_int
+    Recursive: false
+    TriggerFunc: func_int
+    Triggers:
+      # - arg0 == 4294967254
+      # - arg1 == 100000
+      - arg2 == 3.14
+      # - arg3 == 2.71828
+      # - arg4 == 65
+      # - arg5 == 7
+      # - arg6 == 123456
   - Func: func_ptr
     Recursive: false
     TriggerFunc: func_ptr
