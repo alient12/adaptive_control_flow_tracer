@@ -124,6 +124,7 @@ bool mode_probe1_enabled = true;
 bool mode_probe2_enabled = true;
 static const size_t    target_func_max_bytes = 4096;   // how many bytes to scan if failed to get function size
 bool show_raw_args = false;
+bool debug_mode = false;
 
 static uintptr_t program_base(void); // early fwd so we can use it above
 
@@ -132,6 +133,8 @@ static void probe2(struct patch_exec_context *ctx, uint8_t ret);
 static void install_probe1(void *func_addr);
 static void print_libpatch_error(void);
 
+
+/* ------------------------- x86 instruction classification ------------------------- */
 
 typedef struct JumpSite {
     uintptr_t insn_addr;      // branch instruction address
@@ -168,7 +171,162 @@ static void dump_jump_sites(const JumpSite *sites, size_t n, uintptr_t base)
 }
 
 
+static inline void dump_insn_bytes(const cs_insn *insn) {
+    fprintf(stderr, "    bytes:");
+    for (size_t k = 0; k < insn->size && k < 16; k++) {
+        fprintf(stderr, " %02x", insn->bytes[k]);
+    }
+    if (insn->size > 16) fprintf(stderr, " ...");
+    fprintf(stderr, "\n");
+}
 
+static inline const char *grp_name(uint8_t g) {
+    switch (g) {
+        case CS_GRP_JUMP: return "JUMP";
+        case CS_GRP_CALL: return "CALL";
+        case CS_GRP_RET:  return "RET";
+        case CS_GRP_IRET: return "IRET";
+        default: return "?";
+    }
+}
+
+static inline const char *op_type_name(int t) {
+    switch (t) {
+        case X86_OP_REG: return "REG";
+        case X86_OP_IMM: return "IMM";
+        case X86_OP_MEM: return "MEM";
+        default: return "INVALID";
+    }
+}
+
+static inline bool classify_x86_branch_dbg(csh handle, const cs_insn *insn, JumpSite *js) {
+    if (!insn || !js) return false;
+
+    const cs_detail *d = insn->detail;
+
+    fprintf(stderr,
+            "[cls] insn @0x%llx size=%u id=%u %s %s\n",
+            (unsigned long long)insn->address,
+            (unsigned)insn->size,
+            (unsigned)insn->id,
+            insn->mnemonic ? insn->mnemonic : "?",
+            insn->op_str ? insn->op_str : "?");
+
+    dump_insn_bytes(insn);
+
+    if (!d) {
+        fprintf(stderr, "    detail=NULL (CS_OPT_DETAIL not working for this insn)\n");
+        return false;
+    }
+
+    /* ---- groups ---- */
+    fprintf(stderr, "    groups_count=%u groups:", (unsigned)d->groups_count);
+
+    bool is_jump=false, is_call=false, is_ret=false;
+
+    /* Capstone guarantees groups_count <= 8 in many builds, but print safely anyway */
+    unsigned gc = d->groups_count;
+    if (gc > 32) {
+        fprintf(stderr, " [SUSPICIOUS groups_count=%u clamping to 32]", (unsigned)gc);
+        gc = 32;
+    }
+
+    for (unsigned g = 0; g < gc; ++g) {
+        uint8_t grp = d->groups[g];
+        fprintf(stderr, " %u(%s)", grp, grp_name(grp));
+        if (grp == CS_GRP_JUMP) is_jump = true;
+        else if (grp == CS_GRP_CALL) is_call = true;
+        else if (grp == CS_GRP_RET)  is_ret  = true;
+    }
+    fprintf(stderr, "\n");
+    fprintf(stderr, "    flags: is_jump=%d is_call=%d is_ret=%d\n", is_jump, is_call, is_ret);
+
+    if (!(is_jump || is_call || is_ret)) return false;
+
+    memset(js, 0, sizeof(*js));
+    js->insn_addr = (uintptr_t)insn->address;
+    js->next_addr = (uintptr_t)(insn->address + insn->size);
+
+    if (is_ret) {
+        js->is_ret = 1;
+        fprintf(stderr, "    => classified RET\n");
+        return true;
+    }
+
+    /* ---- x86 detail sanity ---- */
+    fprintf(stderr, "    x86.op_count=%u\n", (unsigned)d->x86.op_count);
+    unsigned oc = d->x86.op_count;
+    if (oc > 8) {
+        fprintf(stderr, "    [SUSPICIOUS op_count=%u clamping to 8]\n", (unsigned)oc);
+        oc = 8;
+    }
+
+    if (is_call) {
+        js->is_call = 1;
+        for (unsigned i = 0; i < oc; ++i) {
+            const cs_x86_op *op = &d->x86.operands[i];
+            fprintf(stderr, "      op[%u]: type=%d(%s)", i, op->type, op_type_name(op->type));
+            if (op->type == X86_OP_IMM) {
+                fprintf(stderr, " imm=0x%llx", (unsigned long long)op->imm);
+                js->imm_target = (uintptr_t)op->imm;
+            } else if (op->type == X86_OP_REG) {
+                fprintf(stderr, " reg=%s", cs_reg_name(handle, op->reg));
+            } else if (op->type == X86_OP_MEM) {
+                fprintf(stderr, " mem(base=%s index=%s scale=%d disp=0x%llx)",
+                        cs_reg_name(handle, op->mem.base),
+                        cs_reg_name(handle, op->mem.index),
+                        op->mem.scale,
+                        (unsigned long long)op->mem.disp);
+            }
+            fprintf(stderr, "\n");
+        }
+        fprintf(stderr, "    => classified CALL imm_target=0x%llx\n",
+                (unsigned long long)js->imm_target);
+        return true;
+    }
+
+    bool cond=false, uncond=false, indirect=false;
+
+    fprintf(stderr, "    insn->id=%u name=%s\n",
+            (unsigned)insn->id,
+            cs_insn_name(handle, insn->id));
+
+    if (insn->id == X86_INS_JMP) uncond = true;
+    else cond = true; /* your original assumption */
+
+    for (unsigned i = 0; i < oc; ++i) {
+        const cs_x86_op *op = &d->x86.operands[i];
+        fprintf(stderr, "      op[%u]: type=%d(%s)", i, op->type, op_type_name(op->type));
+        if (op->type == X86_OP_MEM || op->type == X86_OP_REG) indirect = true;
+        if (op->type == X86_OP_IMM) {
+            fprintf(stderr, " imm=0x%llx", (unsigned long long)op->imm);
+            js->imm_target = (uintptr_t)op->imm;
+        } else if (op->type == X86_OP_REG) {
+            fprintf(stderr, " reg=%s", cs_reg_name(handle, op->reg));
+        } else if (op->type == X86_OP_MEM) {
+            fprintf(stderr, " mem(base=%s index=%s scale=%d disp=0x%llx)",
+                    cs_reg_name(handle, op->mem.base),
+                    cs_reg_name(handle, op->mem.index),
+                    op->mem.scale,
+                    (unsigned long long)op->mem.disp);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    js->is_conditional   = cond && !uncond;
+    js->is_unconditional = uncond;
+    js->is_indirect      = indirect && js->imm_target == 0;
+
+    fprintf(stderr,
+            "    => classified JUMP-ish: cond=%d uncond=%d indirect=%d imm_target=%s0x%llx\n",
+            js->is_conditional,
+            js->is_unconditional,
+            js->is_indirect,
+            js->imm_target ? "" : "(none)",
+            (unsigned long long)js->imm_target);
+
+    return true;
+}
 
 /* Fallback stub so the .so loads even if the real builder isn't linked. */
 /* ===== Capstone-based scanner: classify and list jumps inside a function ===== */
@@ -232,6 +390,19 @@ static int find_function_jumps(const void *func_addr,
     cs_insn *insn = NULL;
     size_t n = cs_disasm(handle, code, max_bytes, addr, 0, &insn);
     if (n == 0) { cs_close(&handle); return -ENOEXEC; }
+    
+    if (debug_mode) {
+        for (size_t i = 0; i < n && i < 10; i++) {
+        fprintf(stderr, "[dis] %zu: 0x%llx %-6s %s (size=%u id=%u detail=%p)\n",
+                i,
+                (unsigned long long)insn[i].address,
+                insn[i].mnemonic,
+                insn[i].op_str,
+                (unsigned)insn[i].size,
+                (unsigned)insn[i].id,
+                (void*)insn[i].detail);
+    }
+}
 
     JumpSite *sites = (JumpSite*)calloc(n, sizeof(JumpSite));
     if (!sites) { cs_free(insn, n); cs_close(&handle); return -ENOMEM; }
@@ -239,12 +410,22 @@ static int find_function_jumps(const void *func_addr,
     size_t w = 0;
     for (size_t i = 0; i < n; ++i) {
         JumpSite js;
-        if (classify_x86_branch(&insn[i], &js)) {
-            if (!js.is_ret && !js.is_call) {         // <- keep only Jumps
-                sites[w++] = js;
+        if (debug_mode){
+            if (classify_x86_branch_dbg(handle, &insn[i], &js)) {
+                if (!js.is_ret && !js.is_call) {         // <- keep only Jumps
+                    sites[w++] = js;
+                }
+                if (insn[i].id == X86_INS_RET || insn[i].id == X86_INS_RETF)
+                    break;                // stop scanning at function return
             }
-            if (insn[i].id == X86_INS_RET || insn[i].id == X86_INS_RETF)
-                break;                // stop scanning at function return
+        } else {
+            if (classify_x86_branch(&insn[i], &js)) {
+                if (!js.is_ret && !js.is_call) {         // <- keep only Jumps
+                    sites[w++] = js;
+                }
+                if (insn[i].id == X86_INS_RET || insn[i].id == X86_INS_RETF)
+                    break;                // stop scanning at function return
+            }
         }
     }
 
@@ -923,11 +1104,11 @@ static void preload_init(void) {
         }
     }
 
-    if (mode_probe1_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
-        install_probe1((void*)g_probe_list.probe_addrs[i].trigger_addr);
-    }
     if (mode_probe2_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
         probe2_configure_all(&g_probe_list.probe_addrs[i]); // enabled on demand by probe1
+    }
+    if (mode_probe1_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
+        install_probe1((void*)g_probe_list.probe_addrs[i].trigger_addr);
     }
 
     uintptr_t addr = program_base();

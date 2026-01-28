@@ -310,9 +310,12 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
         (void)dwarf_find_function_lowpc(t->func, &func_off, &func_size);
         (void)dwarf_find_function_lowpc(t->trigger_func, &trig_off, &trig_size);
 
-        /* Debug Print */
-        printf("[triggerdb-setup] Target %zu: Func=%s, Offset=0x%lx, ...\n", 
-               ti, t->func, func_off); // (Abbreviated for brevity)
+        printf("[triggerdb-setup] Target %zu: Func=%s, Offset=0x%lx, Size=0x%lx, Recursive=%d, TriggerFunc=%s, TriggerOffset=0x%lx, TriggerSize=0x%lx, Triggers=[",
+               ti, t->func, func_off, func_size, t->recursive, t->trigger_func, trig_off, trig_size);
+        for (size_t j = 0; j < t->triggers.n; j++) {
+            printf("%s\"%s\"", (j > 0) ? ", " : "", t->triggers.items[j]);
+        }
+        printf("]\n");
 
         /* 1. Fill Group Metadata (Common info) */
         group->target_i = ti;
