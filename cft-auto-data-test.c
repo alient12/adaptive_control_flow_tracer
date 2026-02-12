@@ -30,27 +30,13 @@
 #include <sys/types.h>
 #include <errno.h>
 
-#include "trace_shared.h"
-#include <sched.h>    // sched_getcpu
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 
 #include "trigger_check.h"
+#include "lttng_tp.h"
 
-/* ------------------------- trace buffer ------------------------- */
-typedef struct {
-    trace_event_t    *events;   // points into shared events shm
-    trace_meta_cpu_t *meta;     // points into shared meta for this CPU
-    uint64_t          capacity; // TRACE_BUF_CAPACITY
-} trace_cpu_buffer_t;
-
-static trace_meta_global_t *trace_gmeta      = NULL;
-static trace_meta_cpu_t    *trace_cmeta      = NULL;
-static void                *trace_events_base = NULL;
-
-static trace_cpu_buffer_t  *trace_cpu_buffers = NULL;
-static int                  trace_n_cpus      = 0;
 
 /* ------------------------- trigger & probes ------------------------- */
 static _Thread_local uint64_t tls_raw_args[64];
@@ -99,9 +85,6 @@ int probe2_build_from_function(const void *func_addr,
 void probe2_enable_all(Probe2Set *set);
 void probe2_disable_all(Probe2Set *set);
 void probe2_free(Probe2Set *set);
-void trace_buffers_init(void);
-static inline void trace_record(uint64_t tsc, uint64_t value);
-static inline trace_cpu_buffer_t *trace_get_cpu_buffer(void);
 
 /* compatibility with earlier call sites */
 void probe2_set_enable_all(Probe2Set *set);
@@ -872,7 +855,7 @@ static void probe2(struct patch_exec_context *ctx, uint8_t post) {
         // printf("probe2 at offset 0x%llx\n", (unsigned long long)(*e));
 
         uint64_t offset = *e;
-        trace_record(t1, offset);
+        lttng_ust_tracepoint(wyvern, probe2, offset);
     } else {
         probe2_t0 = rdtsc();
         unsigned long long offset = (unsigned long long)ctx->program_counter - (unsigned long long)program_base();
@@ -1000,136 +983,6 @@ static void dcft_print_banner_wyvern(void)
         "\n");
 }
 
-/* ------------------------- trace buffer management ------------------------- */
-
-void trace_buffers_init(void)
-{
-    if (trace_cpu_buffers) {
-        // already initialised
-        return;
-    }
-
-    long n = sysconf(_SC_NPROCESSORS_CONF);
-    if (n <= 0) n = 1;
-    if (n > TRACE_MAX_CPUS) n = TRACE_MAX_CPUS;
-    trace_n_cpus = (int)n;
-
-    /* ---------- 1) META shared memory (global + per-CPU meta) ---------- */
-
-    size_t meta_size = sizeof(trace_meta_global_t)
-                     + (size_t)trace_n_cpus * sizeof(trace_meta_cpu_t);
-
-    int meta_fd = shm_open(TRACE_SHM_META_NAME, O_CREAT | O_RDWR, 0600);
-    if (meta_fd < 0) {
-        perror("trace: shm_open(meta)");
-        return;
-    }
-    if (ftruncate(meta_fd, (off_t)meta_size) < 0) {
-        perror("trace: ftruncate(meta)");
-        close(meta_fd);
-        return;
-    }
-
-    void *meta_base = mmap(NULL, meta_size,
-                           PROT_READ | PROT_WRITE,
-                           MAP_SHARED, meta_fd, 0);
-    close(meta_fd);  // mapping stays valid
-
-    if (meta_base == MAP_FAILED) {
-        perror("trace: mmap(meta)");
-        return;
-    }
-
-    trace_gmeta = (trace_meta_global_t *)meta_base;
-    trace_cmeta = (trace_meta_cpu_t *)((uint8_t *)meta_base + sizeof(trace_meta_global_t));
-
-    // Fill global meta (what the daemon reads)
-    trace_gmeta->n_cpus      = (uint32_t)trace_n_cpus;
-    trace_gmeta->capacity    = TRACE_BUF_CAPACITY;
-    trace_gmeta->record_size = sizeof(trace_event_t);
-    trace_gmeta->_pad        = 0;
-    trace_gmeta->cycles_per_ns = (uint32_t)cycles_per_ns;
-
-    // Initialise per-CPU meta
-    for (int i = 0; i < trace_n_cpus; ++i) {
-        atomic_store_explicit(&trace_cmeta[i].head, 0, memory_order_relaxed);
-        atomic_store_explicit(&trace_cmeta[i].dropped, 0, memory_order_relaxed);
-    }
-
-    /* ---------- 2) EVENTS shared memory (per-CPU rings) ---------- */
-
-    size_t per_cpu_bytes = TRACE_BUF_CAPACITY * sizeof(trace_event_t);
-    size_t total_bytes   = (size_t)trace_n_cpus * per_cpu_bytes;
-
-    int events_fd = shm_open(TRACE_SHM_EVENTS_NAME, O_CREAT | O_RDWR, 0600);
-    if (events_fd < 0) {
-        perror("trace: shm_open(events)");
-        // leave meta mapped so daemon can see that tracing is "there" but empty
-        return;
-    }
-    if (ftruncate(events_fd, (off_t)total_bytes) < 0) {
-        perror("trace: ftruncate(events)");
-        close(events_fd);
-        return;
-    }
-
-    trace_events_base = mmap(NULL, total_bytes,
-                             PROT_READ | PROT_WRITE,
-                             MAP_SHARED, events_fd, 0);
-    close(events_fd);
-
-    if (trace_events_base == MAP_FAILED) {
-        perror("trace: mmap(events)");
-        return;
-    }
-
-    /* ---------- 3) Local helper array mapping CPUs to their slices ---------- */
-
-    trace_cpu_buffers = calloc((size_t)trace_n_cpus, sizeof(trace_cpu_buffer_t));
-    if (!trace_cpu_buffers) {
-        perror("trace: calloc(trace_cpu_buffers)");
-        return;
-    }
-
-    uint8_t *p = (uint8_t *)trace_events_base;
-    for (int i = 0; i < trace_n_cpus; ++i) {
-        trace_cpu_buffers[i].capacity = TRACE_BUF_CAPACITY;
-        trace_cpu_buffers[i].events   = (trace_event_t *)(p + (size_t)i * per_cpu_bytes);
-        trace_cpu_buffers[i].meta     = &trace_cmeta[i];
-    }
-}
-
-
-static inline trace_cpu_buffer_t *trace_get_cpu_buffer(void)
-{
-    if (!trace_cpu_buffers || trace_n_cpus <= 0) return NULL;
-
-    int cpu = sched_getcpu();
-    if (cpu < 0 || cpu >= trace_n_cpus) {
-        return NULL;
-    }
-    return &trace_cpu_buffers[cpu];
-}
-
-static inline void trace_record(uint64_t tsc, uint64_t value)
-{
-    // choose CPU somehow (e.g. sched_getcpu());
-    int cpu = sched_getcpu();
-    if (cpu < 0 || cpu >= trace_n_cpus) return;
-
-    trace_cpu_buffer_t *buf = &trace_cpu_buffers[cpu];
-    if (!buf->events || !buf->meta || buf->capacity == 0) return;
-
-    trace_meta_cpu_t *m = buf->meta;
-
-    uint64_t idx = atomic_fetch_add_explicit(&m->head, 1, memory_order_relaxed);
-    uint64_t slot = idx & (buf->capacity - 1);
-
-    trace_event_t *ev = &buf->events[slot];
-    ev->tsc   = tsc;
-    ev->value = value;
-}
-
 
 /* ------------------------- constructor ------------------------- */
 
@@ -1145,7 +998,6 @@ static void preload_init(void) {
     ensure_patch(patch_init, options, array_size(options));
 
     triggerdb_setup(&trigger_db, "config.yaml");
-    trace_buffers_init();
 
     /* Iterate over Groups instead of Entries */
     for (size_t i = 0; i < trigger_db.n_groups; ++i) {
@@ -1240,7 +1092,7 @@ uintptr_t base_address_for_pid(pid_t pid) {
 /* ------------------------- build hints ------------------------- */
 /*
 Compile:
-  gcc -shared -fPIC cft-auto-data-test.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch
+  gcc -shared -fPIC cft-auto-data-test.c lttng_tp.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch -llttng-ust
 Run:
   LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
   LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/data/test/input/inp.in
