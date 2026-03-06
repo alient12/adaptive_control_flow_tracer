@@ -1352,6 +1352,12 @@ int dwarf_update_function_offset_table_from_elf(int include_plt)
     return added;
 }
 
+FuncOffTable *get_function_offset_table(void)
+{
+    if (dwarf_build_function_offset_table() != 0) return NULL;
+    return &g_fotab;
+}
+
 /* ------------------------------ Freeing ------------------------------ */
 
 static void free_vartype_shallow(VarType *v)
