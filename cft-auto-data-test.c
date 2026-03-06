@@ -37,6 +37,10 @@
 #include "trigger_check.h"
 #include "lttng_tp.h"
 
+#include <sys/prctl.h>
+#include <linux/prctl.h>
+#include <signal.h>
+
 
 /* ------------------------- trigger & probes ------------------------- */
 static _Thread_local uint64_t tls_raw_args[64];
@@ -109,6 +113,9 @@ static const size_t    target_func_max_bytes = 4096;   // how many bytes to scan
 bool show_raw_args = false;
 bool debug_mode = false;
 bool show_probe_trigger_hits = false;
+
+bool g_probe1_all_funcs_flag = false; // is installed or not, used for test/demo purposes
+Probe2Set p1set = {0};
 
 static uintptr_t program_base(void); // early fwd so we can use it above
 
@@ -793,43 +800,43 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         }
         Probe2Set *p2set = &g_probe_list.probe_addrs[probe_index].p2set;
 
-        GroupTriggerEntry *group = &trigger_db.groups[probe_index];
+        // GroupTriggerEntry *group = &trigger_db.groups[probe_index];
 
-        // Extract args ONCE for the whole group (Optimization)
-        uint64_t *raw_args = tls_raw_args;
-        const FuncSig *sig = group->sig;
-        int result = 0;
+        // // Extract args ONCE for the whole group (Optimization)
+        // uint64_t *raw_args = tls_raw_args;
+        // const FuncSig *sig = group->sig;
+        // int result = 0;
 
-        if (sig) {
-            extract_raw_args_sysv_x86_64(ctx, sig, raw_args);
+        // if (sig) {
+        //     extract_raw_args_sysv_x86_64(ctx, sig, raw_args);
 
-            // Iterate through all triggers in this group
-            for (size_t k = 0; k < group->n_entries; k++) {
-                TriggerEntry *entry = &group->entries[k];
+        //     // Iterate through all triggers in this group
+        //     for (size_t k = 0; k < group->n_entries; k++) {
+        //         TriggerEntry *entry = &group->entries[k];
 
-                if (entry->compiled_ok) {
-                    result = eval_compiled_trigger(&entry->compiled, sig, raw_args);
-                    if (result) break; // short-circuit on first match
-                }
-            }
-        }
+        //         if (entry->compiled_ok) {
+        //             result = eval_compiled_trigger(&entry->compiled, sig, raw_args);
+        //             if (result) break; // short-circuit on first match
+        //         }
+        //     }
+        // }
 
-        if (show_raw_args)
-        {
-            printf("[probe1-%zu]: raw args: ", probe_index);
-            for (size_t i = 0; i < sig->n_args; ++i) {
-                printf("%" PRIu64 " ", raw_args[i]);
-            }
-            printf("\n");
-        }
+        // if (show_raw_args)
+        // {
+        //     printf("[probe1-%zu]: raw args: ", probe_index);
+        //     for (size_t i = 0; i < sig->n_args; ++i) {
+        //         printf("%" PRIu64 " ", raw_args[i]);
+        //     }
+        //     printf("\n");
+        // }
 
-        if (show_probe_trigger_hits && result)
-            printf("[probe1-%zu]: eval triggered\n", probe_index);
+        // if (show_probe_trigger_hits && result)
+        //     printf("[probe1-%zu]: eval triggered\n", probe_index);
         
-        // // result = 1; // for testing, always enable probe2
-        if (mode_probe2_enabled) {
-            if (result) probe2_enable_all(p2set); else probe2_disable_all(p2set);
-        }
+        // // // result = 1; // for testing, always enable probe2
+        // if (mode_probe2_enabled) {
+        //     if (result) probe2_enable_all(p2set); else probe2_disable_all(p2set);
+        // }
 
         uint64_t d = rdtsc() - probe1_t0;
         atomic_fetch_add_explicit(&probe1_cycles, d, memory_order_relaxed);
@@ -842,6 +849,7 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         atomic_fetch_add_explicit(&g_probe_time_stats.total_cycles, d, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_probe_time_stats.calls, 1, memory_order_relaxed);
         // printf("[probe_time]: function took %llu cycles\n", (unsigned long long)d);
+        lttng_ust_tracepoint(wyvern, probe2, d);
     }
 }
 
@@ -983,13 +991,164 @@ static void dcft_print_banner_wyvern(void)
         "\n");
 }
 
+static int probe1_build_from_dwarf_function(Probe2Set *set,
+                               void (*handler)(struct patch_exec_context*, uint8_t),
+                               void *user_data)
+{
+    static DwarfModel *g_model = NULL;
+    static FuncOffTable g_fotab = {0};
+
+    g_model = dwarf_scan_collect_model();
+
+    dwarf_build_function_offset_table();
+    dwarf_update_function_offset_table_from_elf(/*include_plt=*/1);
+
+    g_fotab = *get_function_offset_table();
+
+    printf("══════════════════════════════════════════════════════════════════\n");
+    printf("Discovered %zu functions in the offset table.\n", g_fotab.len);
+
+    // remove @plt and _ and size 0 entries from the offset table
+    size_t write_index = 0;
+    for (size_t i = 0; i < g_fotab.len; i++) {
+        if (strstr(g_fotab.items[i].name, "@plt") ||
+            strcmp(g_fotab.items[i].name, "_start") == 0 ||
+            g_fotab.items[i].size == 0) {
+            continue; // skip this entry
+        }
+        if (write_index != i) {
+            g_fotab.items[write_index] = g_fotab.items[i]; // move valid entry to write_index
+        }
+        write_index++;
+    }
+    g_fotab.len = write_index; // update length to new count
+    size_t n = g_fotab.len;
+
+    // print offset table
+    for (size_t i = 0; i < g_fotab.len; i++) {
+        printf("Function: %s -> low_pc: 0x%llx, size: 0x%llx\n",
+               g_fotab.items[i].name,
+               (unsigned long long)g_fotab.items[i].lowpc,
+               (unsigned long long)g_fotab.items[i].size);
+    }
+    printf("══════════════════════════════════════════════════════════════════\n");
+    memset(set, 0, sizeof(*set));
+
+    set->patches = (patch_t*)calloc(n, sizeof(patch_t));
+    set->ready   = (bool*)calloc(n, sizeof(bool));
+    set->enabled = (bool*)calloc(n, sizeof(bool));
+    if (!set->patches || !set->ready || !set->enabled) {
+        free(set->patches); free(set->ready); free(set->enabled);
+        memset(set, 0, sizeof(*set));
+        return -ENOMEM;
+    }
+
+    /* ***** libpatch strategy: forbid trap-based patches (no SIGTRAP punning) ***** */
+    patch_attr   attr;
+    patch_status st_attr;
+
+    st_attr = patch_attr_init(&attr, sizeof(attr));
+    if (st_attr != PATCH_OK) {
+        print_libpatch_error();
+        free(set->patches); free(set->ready); free(set->enabled);
+        memset(set, 0, sizeof(*set));
+        return -EFAULT;
+    }
+
+    st_attr = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORBID);
+    if (st_attr != PATCH_OK) {
+        print_libpatch_error();
+        patch_attr_fini(&attr);
+        free(set->patches); free(set->ready); free(set->enabled);
+        memset(set, 0, sizeof(*set));
+        return -EFAULT;
+    }
+
+    st_attr = patch_attr_set_abi(&attr, PATCH_ABI_OS);
+    if (st_attr != PATCH_OK) {
+        print_libpatch_error();
+        patch_attr_fini(&attr);
+        free(set->patches); free(set->ready); free(set->enabled);
+        memset(set, 0, sizeof(*set));
+        return -EFAULT;
+    }
+    /* ***** end libpatch strategy ***** */
+
+    for (size_t i = 0; i < n; ++i) {
+        const uintptr_t site = g_fotab.items[i].lowpc + program_base(); // patch at function entry
+        struct patch_location location = {
+            .type        = PATCH_LOCATION_RANGE,
+            .direction   = PATCH_LOCATION_FORWARD,
+            .algorithm   = PATCH_LOCATION_FIRST,
+            .range.lower = site,
+            .range.upper = 0,
+        };
+        struct patch_exec_model exec_model = {
+            .type                    = PATCH_EXEC_MODEL_PROBE_AROUND,
+            .probe.read_registers    = 0,
+            .probe.write_registers   = 0,
+            .probe.clobber_registers = PATCH_REGS_ALL,
+            .probe.user_data         = user_data,
+            .probe.procedure         = handler,
+        };
+        patch_status st = patch_make(&location, &exec_model, &attr,
+                                     &set->patches[i], NULL);
+        if (st == PATCH_OK) set->ready[i] = true; else print_libpatch_error();
+    }
+
+    /* ***** libpatch strategy: cleanup attributes ***** */
+    patch_attr_fini(&attr);
+    /* ***** end libpatch strategy ***** */
+
+    (void)patch_commit();
+    set->count = n;
+    return 0;
+}
+
+
+static void on_sig(int sig, siginfo_t *si, void *uc) {
+    (void)si; (void)uc;
+
+    printf("[wyvern] Signal received: %d\n", sig);
+    fflush(stdout);
+    if (sig == SIGUSR1+0) {
+        if (!g_probe1_all_funcs_flag) {
+            printf("[wyvern] Enabling all probe1 patches due to signal...\n");
+            probe2_enable_all(&p1set);
+            g_probe1_all_funcs_flag = true;
+        } else {
+            printf("[wyvern] All probe1 patches already enabled, ignoring signal.\n");
+        }
+    }
+
+    if (sig == SIGUSR1+1) {
+        if (g_probe1_all_funcs_flag) {
+            printf("[wyvern] Disabling all probe1 patches due to signal...\n");
+            probe2_disable_all(&p1set);
+            g_probe1_all_funcs_flag = false;
+        } else {
+            printf("[wyvern] All probe1 patches already disabled, ignoring signal.\n");
+        }
+    }
+}
+
+static void install_signal_handler(int sig) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = on_sig;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, NULL);
+}
+
 
 /* ------------------------- constructor ------------------------- */
 
 __attribute__((constructor))
 static void preload_init(void) {
+    prctl(PR_SET_NAME, "WYVERN-DCFT", 0, 0, 0);
     dcft_print_banner_wyvern();
-    puts("DCFT (preloaded) initialising...");
+    puts("[wyvern] DCFT (preloaded) initialising...");
 
     calibrate_tsc();
     const struct patch_option options[] = {
@@ -997,75 +1156,79 @@ static void preload_init(void) {
     };
     ensure_patch(patch_init, options, array_size(options));
 
-    triggerdb_setup(&trigger_db, "config.yaml");
+    // triggerdb_setup(&trigger_db, "config.yaml");
 
-    /* Iterate over Groups instead of Entries */
-    for (size_t i = 0; i < trigger_db.n_groups; ++i) {
-        GroupTriggerEntry *group = &trigger_db.groups[i];
+    // /* Iterate over Groups instead of Entries */
+    // for (size_t i = 0; i < trigger_db.n_groups; ++i) {
+    //     GroupTriggerEntry *group = &trigger_db.groups[i];
 
-        /* Use group metadata */
-        if (group->func_size > 0) {
-            uintptr_t target_lowpc    = group->func_lowpc;
-            uintptr_t trigger_lowpc   = group->trigger_func_lowpc;
-            char *target_name         = group->func_name;
-            uint64_t target_size      = group->func_size > 0 ? group->func_size : target_func_max_bytes;
+    //     /* Use group metadata */
+    //     if (group->func_size > 0) {
+    //         uintptr_t target_lowpc    = group->func_lowpc;
+    //         uintptr_t trigger_lowpc   = group->trigger_func_lowpc;
+    //         char *target_name         = group->func_name;
+    //         uint64_t target_size      = group->func_size > 0 ? group->func_size : target_func_max_bytes;
 
-            /* Optional: Check if name already in the list (in case config has duplicate targets) */
-            int found = 0;
-            for (size_t j = 0; j < g_probe_list.n_probes; ++j) {
-                if (strcmp(g_probe_list.probe_addrs[j].target_name, target_name) == 0) {
-                    found = 1;
-                    break;
-                }
-            }
-            if (found) continue;
+    //         /* Optional: Check if name already in the list (in case config has duplicate targets) */
+    //         int found = 0;
+    //         for (size_t j = 0; j < g_probe_list.n_probes; ++j) {
+    //             if (strcmp(g_probe_list.probe_addrs[j].target_name, target_name) == 0) {
+    //                 found = 1;
+    //                 break;
+    //             }
+    //         }
+    //         if (found) continue;
 
-            /* Expand the probe list */
-            ProbeID *new_list = (ProbeID*)realloc(g_probe_list.probe_addrs,
-                                                  (g_probe_list.n_probes + 1) * sizeof(ProbeID));
-            if (!new_list) {
-                fprintf(stderr, "[probe2-config] failed to realloc probe addrs\n");
-                return;
-            }
-            g_probe_list.probe_addrs = new_list;
+    //         /* Expand the probe list */
+    //         ProbeID *new_list = (ProbeID*)realloc(g_probe_list.probe_addrs,
+    //                                               (g_probe_list.n_probes + 1) * sizeof(ProbeID));
+    //         if (!new_list) {
+    //             fprintf(stderr, "[probe2-config] failed to realloc probe addrs\n");
+    //             return;
+    //         }
+    //         g_probe_list.probe_addrs = new_list;
 
-            /* Register the probe using Group data */
-            ProbeID *p = &g_probe_list.probe_addrs[g_probe_list.n_probes];
+    //         /* Register the probe using Group data */
+    //         ProbeID *p = &g_probe_list.probe_addrs[g_probe_list.n_probes];
             
-            p->target_addr  = program_base() + target_lowpc;
-            p->trigger_addr = program_base() + trigger_lowpc;
-            p->target_name  = target_name;
-            p->target_size  = target_size;
-            p->p2set        = (Probe2Set){0};
-            p->index        = i; /* Store the GROUP index here, not the entry index */
+    //         p->target_addr  = program_base() + target_lowpc;
+    //         p->trigger_addr = program_base() + trigger_lowpc;
+    //         p->target_name  = target_name;
+    //         p->target_size  = target_size;
+    //         p->p2set        = (Probe2Set){0};
+    //         p->index        = i; /* Store the GROUP index here, not the entry index */
             
-            g_probe_list.n_probes++;
-        }
-    }
+    //         g_probe_list.n_probes++;
+    //     }
+    // }
 
-    if (mode_probe2_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
-        probe2_configure_all(&g_probe_list.probe_addrs[i]); // enabled on demand by probe1
-    }
-    if (mode_probe1_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
-        install_probe1((void*)g_probe_list.probe_addrs[i].trigger_addr);
-    }
+    // if (mode_probe2_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
+    //     probe2_configure_all(&g_probe_list.probe_addrs[i]); // enabled on demand by probe1
+    // }
+    // if (mode_probe1_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
+    //     install_probe1((void*)g_probe_list.probe_addrs[i].trigger_addr);
+    // }
+
+    probe1_build_from_dwarf_function(&p1set, &probe1, &exit_value);
+    install_signal_handler(SIGUSR1+0); // signal to enable all probe1 patches
+    install_signal_handler(SIGUSR1+1); // signal to disable all probe1 patches
 
     uintptr_t addr = program_base();
-    printf("DCFT: main executable base address: 0x%" PRIxPTR "\n", addr);
+    printf("[wyvern] DCFT: main executable base address: 0x%" PRIxPTR "\n", addr);
 }
 
 /* ------------------------- destructor ------------------------- */
 
 __attribute__((destructor))
 static void preload_fini(void) {
-    puts("DCFT (preloaded) shutting down...");
+    puts("[wyvern] DCFT (preloaded) shutting down...");
 
     (void) patch_fini();
 
 	print_probe_time_summary();
     print_test_summary();
 
-    puts("DCFT cleanup complete.");
+    puts("[wyvern] DCFT cleanup complete.");
 }
 
 
