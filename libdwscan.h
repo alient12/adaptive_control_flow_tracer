@@ -22,8 +22,15 @@
 #include <string.h>
 #include <stdint.h>
 
+#if __has_include(<libdwarf/libdwarf.h>)
 #include <libdwarf/libdwarf.h>
 #include <libdwarf/dwarf.h>
+#elif __has_include(<libdwarf-2/libdwarf.h>)
+#include <libdwarf-2/libdwarf.h>
+#include <libdwarf-2/dwarf.h>
+#else
+#error "libdwarf headers not found"
+#endif
 
 #include <elf.h>
 #include <errno.h>
