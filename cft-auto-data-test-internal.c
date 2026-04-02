@@ -41,6 +41,140 @@
 #include <linux/prctl.h>
 #include <signal.h>
 
+/* ------------------------- disk and ring buffer ------------------------- */
+#include <pthread.h>
+
+#define BUF_SIZE 65536
+
+typedef struct {
+    uint64_t time_ns;
+    uint64_t address;
+    uint64_t elapsed_time;
+} record_t;
+
+static record_t g_buf[BUF_SIZE];
+static size_t g_head = 0;
+static size_t g_tail = 0;
+static size_t g_count = 0;
+
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+
+static pthread_t g_thread;
+static int g_thread_started = 0;
+static int g_stop = 0;
+
+static __thread int g_internal_thread = 0;
+
+static void *writer_thread_func(void *arg)
+{
+    FILE *fp;
+    (void)arg;
+
+    g_internal_thread = 1;
+
+    fp = fopen("/tmp/wyvern-data.csv", "w");
+    if (!fp) {
+        perror("fopen");
+        return NULL;
+    }
+
+    fprintf(fp, "time_ns,address,elapsed_time\n");
+    fflush(fp);
+
+    while (1) {
+        record_t rec;
+
+        pthread_mutex_lock(&g_lock);
+
+        while (g_count == 0 && !g_stop) {
+            pthread_cond_wait(&g_cond, &g_lock);
+        }
+
+        if (g_count == 0 && g_stop) {
+            pthread_mutex_unlock(&g_lock);
+            break;
+        }
+
+        rec = g_buf[g_tail];
+        g_tail = (g_tail + 1) % BUF_SIZE;
+        g_count--;
+
+        pthread_mutex_unlock(&g_lock);
+
+        fprintf(fp, "%llu,0x%llx,%llu\n",
+                (unsigned long long)rec.time_ns,
+                (unsigned long long)rec.address,
+                (unsigned long long)rec.elapsed_time);
+        fflush(fp);
+    }
+
+    fflush(fp);
+    fclose(fp);
+    return NULL;
+}
+
+void wyvern_start_thread(void)
+{
+    if (g_thread_started) {
+        return;
+    }
+
+    g_stop = 0;
+
+    if (pthread_create(&g_thread, NULL, writer_thread_func, NULL) != 0) {
+        perror("pthread_create");
+        return;
+    }
+
+    g_thread_started = 1;
+}
+
+void wyvern_stop_thread(void)
+{
+    if (!g_thread_started) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    g_stop = 1;
+    pthread_cond_signal(&g_cond);
+    pthread_mutex_unlock(&g_lock);
+
+    pthread_join(g_thread, NULL);
+    g_thread_started = 0;
+}
+
+void wyvern_push(uint64_t address, uint64_t elapsed_time)
+{
+    if (g_internal_thread) {
+        return;
+    }
+
+    if (!g_thread_started) {
+        wyvern_start_thread();
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+    pthread_mutex_lock(&g_lock);
+
+    if (g_count < BUF_SIZE) {
+        g_buf[g_head].time_ns = now_ns;
+        g_buf[g_head].address = address;
+        g_buf[g_head].elapsed_time = elapsed_time;
+
+        g_head = (g_head + 1) % BUF_SIZE;
+        g_count++;
+
+        pthread_cond_signal(&g_cond);
+    }
+
+    pthread_mutex_unlock(&g_lock);
+}
 
 /* ------------------------- trigger & probes ------------------------- */
 static _Thread_local uint64_t tls_raw_args[64];
@@ -849,7 +983,10 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         atomic_fetch_add_explicit(&g_probe_time_stats.total_cycles, d, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_probe_time_stats.calls, 1, memory_order_relaxed);
         // printf("[probe_time]: function took %llu cycles\n", (unsigned long long)d);
-        lttng_ust_tracepoint(wyvern, probe1, d);
+        // lttng_ust_tracepoint(wyvern, probe1, d);
+        uintptr_t pc = (uintptr_t)ctx->program_counter;
+        uint64_t offset = pc - program_base();
+        wyvern_push(offset, d);
     }
 }
 
@@ -1215,6 +1352,7 @@ static void preload_init(void) {
 
     uintptr_t addr = program_base();
     printf("[wyvern] DCFT: main executable base address: 0x%" PRIxPTR "\n", addr);
+    wyvern_start_thread();
 }
 
 /* ------------------------- destructor ------------------------- */
@@ -1229,6 +1367,7 @@ static void preload_fini(void) {
     print_test_summary();
 
     puts("[wyvern] DCFT cleanup complete.");
+    wyvern_stop_thread();
 }
 
 
@@ -1255,8 +1394,8 @@ uintptr_t base_address_for_pid(pid_t pid) {
 /* ------------------------- build hints ------------------------- */
 /*
 Compile:
-  gcc -shared -fPIC cft-auto-data-test.c lttng_tp.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch -llttng-ust
+  gcc -shared -fPIC -pthread cft-auto-data-test-internal.c lttng_tp.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test-internal.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch -llttng-ust
 Run:
-  LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
-  LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/data/test/input/inp.in
+  LD_PRELOAD=$PWD/cft-auto-data-test-internal.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
+  LD_PRELOAD=$PWD/cft-auto-data-test-internal.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/data/test/input/inp.in
 */

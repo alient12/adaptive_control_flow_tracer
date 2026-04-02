@@ -11,6 +11,17 @@
 
 LTTNG_UST_TRACEPOINT_EVENT(
     wyvern,
+    probe1,
+    LTTNG_UST_TP_ARGS(
+        uint64_t, time_ns
+    ),
+    LTTNG_UST_TP_FIELDS(
+        lttng_ust_field_integer(uint64_t, elapsed_time_ns, time_ns)
+    )
+)
+
+LTTNG_UST_TRACEPOINT_EVENT(
+    wyvern,
     probe2,
     LTTNG_UST_TP_ARGS(
         uint64_t, ip
