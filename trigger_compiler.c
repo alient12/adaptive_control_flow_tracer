@@ -29,6 +29,9 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <cjson/cJSON.h>
+#include <inttypes.h>
+
 #include "trigger_compiler.h"
 
 /* ============================== Timing helpers =============================== */
@@ -812,39 +815,49 @@ static void lex_next(Lexer *L)
     if (c == '"')  { lex_read_quoted(L, '"');  return; }
     if (c == '\'') { lex_read_quoted(L, '\''); return; }
 
-    if (isdigit(c)) {
+    if (isdigit(c) ||
+        (c == '-' && (
+            isdigit((unsigned char)L->s[L->i + 1]) ||
+            (L->s[L->i + 1] == '.' && isdigit((unsigned char)L->s[L->i + 2])) ||
+            (L->s[L->i + 1] == '0' && (L->s[L->i + 2] == 'x' || L->s[L->i + 2] == 'X'))
+        )))
+    {
         size_t start = L->i;
-        int is_hex = (c=='0' && (L->s[L->i+1]=='x' || L->s[L->i+1]=='X'));
         int has_dot = 0;
 
-        if (is_hex) {
+        /* optional leading minus */
+        if (L->s[L->i] == '-') L->i++;
+
+        /* signed hex: -0x10 or 0x10 */
+        if (L->s[L->i] == '0' && (L->s[L->i + 1] == 'x' || L->s[L->i + 1] == 'X')) {
             L->i += 2;
             while (isxdigit((unsigned char)L->s[L->i])) L->i++;
+
             size_t n = L->i - start;
             char tmp[128];
-            if (n >= sizeof(tmp)) n = sizeof(tmp)-1;
-            // memcpy(tmp, L->s+start, n); tmp[n]=0;
-            if (safe_read_bytes(L->s+start, tmp, n) != 0)
-            {
+            if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+            if (safe_read_bytes(L->s + start, tmp, n) != 0) {
                 printf("[error] safe_read_bytes failed for hex number read\n");
                 L->cur.kind = TK_EOF;
                 return;
             }
+            tmp[n] = 0;
+
             L->cur.kind = TK_NUMBER;
-            L->cur.i = (int64_t)strtoll(tmp, NULL, 16);
+            L->cur.i = (int64_t)strtoll(tmp, NULL, 0);   /* base 0 handles 0x and -0x */
             return;
         }
 
-        while (isdigit((unsigned char)L->s[L->i]) || L->s[L->i]=='.') {
-            if (L->s[L->i]=='.') has_dot = 1;
+        /* decimal / float: -12, -3.14, .5 only if you want to support it through "-.5" */
+        while (isdigit((unsigned char)L->s[L->i]) || L->s[L->i] == '.') {
+            if (L->s[L->i] == '.') has_dot = 1;
             L->i++;
         }
+
         size_t n = L->i - start;
         char tmp[128];
-        if (n >= sizeof(tmp)) n = sizeof(tmp)-1;
-        // memcpy(tmp, L->s+start, n); tmp[n]=0;
-        if (safe_read_bytes(L->s+start, tmp, n) != 0)
-        {
+        if (n >= sizeof(tmp)) n = sizeof(tmp) - 1;
+        if (safe_read_bytes(L->s + start, tmp, n) != 0) {
             printf("[error] safe_read_bytes failed for decimal number read\n");
             L->cur.kind = TK_EOF;
             return;
@@ -1286,6 +1299,510 @@ int eval_compiled_trigger(const CompiledTrigger *t, const FuncSig *sig, const ui
     if (!t || !t->root || !sig || !raw_args) return 0;
     Value r = eval_node(t->root, sig, raw_args);
     return value_truthy(r);
+}
+
+
+/* ======================= JSON Dumps ======================= */
+/* -------------------- helpers -------------------- */
+
+#ifndef JSON_MAX_DEPTH
+#define JSON_MAX_DEPTH 6
+#endif
+
+#ifndef JSON_MAX_ARRAY_ELEMS
+#define JSON_MAX_ARRAY_ELEMS 16
+#endif
+
+static const char *vk_name(VarKind k)
+{
+    switch (k) {
+        case VT_BASE:      return "base";
+        case VT_POINTER:   return "pointer";
+        case VT_ARRAY:     return "array";
+        case VT_STRUCT:    return "struct";
+        case VT_UNION:     return "union";
+        case VT_ENUM:      return "enum";
+        case VT_TYPEDEF:   return "typedef";
+        case VT_QUALIFIER: return "qualifier";
+        default:           return "unknown";
+    }
+}
+
+static int is_signed_int_name2(const char *n)
+{
+    if (!n) return 0;
+    return !strcmp(n, "char") ||
+           !strcmp(n, "signed char") ||
+           !strcmp(n, "short") ||
+           !strcmp(n, "short int") ||
+           !strcmp(n, "int") ||
+           !strcmp(n, "long") ||
+           !strcmp(n, "long int") ||
+           !strcmp(n, "long long") ||
+           !strcmp(n, "long long int") ||
+           !strcmp(n, "int8_t") ||
+           !strcmp(n, "int16_t") ||
+           !strcmp(n, "int32_t") ||
+           !strcmp(n, "int64_t");
+}
+
+static int is_unsigned_int_name2(const char *n)
+{
+    if (!n) return 0;
+    return !strcmp(n, "unsigned char") ||
+           !strcmp(n, "unsigned short") ||
+           !strcmp(n, "unsigned short int") ||
+           !strcmp(n, "unsigned int") ||
+           !strcmp(n, "unsigned long") ||
+           !strcmp(n, "unsigned long int") ||
+           !strcmp(n, "unsigned long long") ||
+           !strcmp(n, "unsigned long long int") ||
+           !strcmp(n, "uint8_t") ||
+           !strcmp(n, "uint16_t") ||
+           !strcmp(n, "uint32_t") ||
+           !strcmp(n, "uint64_t") ||
+           !strcmp(n, "size_t");
+}
+
+static int is_bool_name2(const char *n)
+{
+    if (!n) return 0;
+    return !strcmp(n, "_Bool") || !strcmp(n, "bool");
+}
+
+static int is_char_base_type(const VarType *t)
+{
+    t = vt_unwrap(t);
+    if (!t || t->kind != VT_BASE || !t->name) return 0;
+    return !strcmp(t->name, "char") ||
+           !strcmp(t->name, "signed char") ||
+           !strcmp(t->name, "unsigned char");
+}
+
+static int is_cstring_array(const VarType *t)
+{
+    t = vt_unwrap(t);
+    if (!t || t->kind != VT_ARRAY) return 0;
+    return is_char_base_type(t->element);
+}
+
+static cJSON *dump_value_json_real(const VarType *t, const void *addr, int depth);
+
+/* -------------------- scalar reading -------------------- */
+
+static size_t vartype_size_guess(const VarType *t)
+{
+    t = vt_unwrap(t);
+    if (!t) return 0;
+
+    if (t->kind == VT_POINTER) return sizeof(void *);
+
+    if (t->kind == VT_BASE && t->name) {
+        if (!strcmp(t->name, "char") || !strcmp(t->name, "signed char") || !strcmp(t->name, "unsigned char"))
+            return 1;
+        if (!strcmp(t->name, "short") || !strcmp(t->name, "short int") ||
+            !strcmp(t->name, "unsigned short") || !strcmp(t->name, "unsigned short int"))
+            return 2;
+        if (!strcmp(t->name, "int") || !strcmp(t->name, "unsigned int") ||
+            !strcmp(t->name, "float") || !strcmp(t->name, "enum"))
+            return 4;
+        if (!strcmp(t->name, "long") || !strcmp(t->name, "unsigned long") ||
+            !strcmp(t->name, "long int") || !strcmp(t->name, "unsigned long int") ||
+            !strcmp(t->name, "long long") || !strcmp(t->name, "unsigned long long") ||
+            !strcmp(t->name, "double") || !strcmp(t->name, "int64_t") || !strcmp(t->name, "uint64_t"))
+            return 8;
+    }
+
+    return 0;
+}
+
+static cJSON *dump_base_json_real(const VarType *t, const void *addr)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "kind", "base");
+    cJSON_AddStringToObject(obj, "type_name", (t && t->name) ? t->name : "unknown");
+
+    if (!addr) {
+        cJSON_AddNullToObject(obj, "value");
+        return obj;
+    }
+
+    t = vt_unwrap(t);
+    if (!t) {
+        cJSON_AddStringToObject(obj, "value", "<invalid-type>");
+        return obj;
+    }
+
+    if (is_bool_name2(t->name)) {
+        unsigned char v = 0;
+        if (safe_read_bytes(addr, &v, sizeof(v)) != 0)
+            cJSON_AddStringToObject(obj, "value", "<read-error>");
+        else
+            cJSON_AddBoolToObject(obj, "value", v ? 1 : 0);
+        return obj;
+    }
+
+    if (t->name && strcmp(t->name, "float") == 0) {
+        float v = 0.0f;
+        if (safe_read_bytes(addr, &v, sizeof(v)) != 0)
+            cJSON_AddStringToObject(obj, "value", "<read-error>");
+        else
+            cJSON_AddNumberToObject(obj, "value", (double)v);
+        return obj;
+    }
+
+    if (t->name && strcmp(t->name, "double") == 0) {
+        double v = 0.0;
+        if (safe_read_bytes(addr, &v, sizeof(v)) != 0)
+            cJSON_AddStringToObject(obj, "value", "<read-error>");
+        else
+            cJSON_AddNumberToObject(obj, "value", v);
+        return obj;
+    }
+
+    if (is_signed_int_name2(t->name)) {
+        size_t sz = vartype_size_guess(t);
+        int64_t v = 0;
+
+        if (sz == 1) {
+            int8_t x = 0;
+            if (safe_read_bytes(addr, &x, 1) != 0) cJSON_AddStringToObject(obj, "value", "<read-error>");
+            else cJSON_AddNumberToObject(obj, "value", (double)x);
+            return obj;
+        }
+        if (sz == 2) {
+            int16_t x = 0;
+            if (safe_read_bytes(addr, &x, 2) != 0) cJSON_AddStringToObject(obj, "value", "<read-error>");
+            else cJSON_AddNumberToObject(obj, "value", (double)x);
+            return obj;
+        }
+        if (sz == 4) {
+            int32_t x = 0;
+            if (safe_read_bytes(addr, &x, 4) != 0) cJSON_AddStringToObject(obj, "value", "<read-error>");
+            else cJSON_AddNumberToObject(obj, "value", (double)x);
+            return obj;
+        }
+        if (sz == 8) {
+            if (safe_read_bytes(addr, &v, 8) != 0) cJSON_AddStringToObject(obj, "value", "<read-error>");
+            else cJSON_AddNumberToObject(obj, "value", (double)v);
+            return obj;
+        }
+    }
+
+    if (is_unsigned_int_name2(t->name)) {
+        size_t sz = vartype_size_guess(t);
+
+        if (sz == 1) {
+            uint8_t x = 0;
+            if (safe_read_bytes(addr, &x, 1) != 0) cJSON_AddStringToObject(obj, "value", "<read-error>");
+            else cJSON_AddNumberToObject(obj, "value", (double)x);
+            return obj;
+        }
+        if (sz == 2) {
+            uint16_t x = 0;
+            if (safe_read_bytes(addr, &x, 2) != 0) cJSON_AddStringToObject(obj, "value", "<read-error>");
+            else cJSON_AddNumberToObject(obj, "value", (double)x);
+            return obj;
+        }
+        if (sz == 4) {
+            uint32_t x = 0;
+            if (safe_read_bytes(addr, &x, 4) != 0) cJSON_AddStringToObject(obj, "value", "<read-error>");
+            else cJSON_AddNumberToObject(obj, "value", (double)x);
+            return obj;
+        }
+        if (sz == 8) {
+            uint64_t x = 0;
+            if (safe_read_bytes(addr, &x, 8) != 0) cJSON_AddStringToObject(obj, "value", "<read-error>");
+            else {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%" PRIu64, x);
+                cJSON_AddStringToObject(obj, "value", buf);
+                cJSON_AddStringToObject(obj, "value_hex", "");
+                cJSON_ReplaceItemInObject(obj, "value_hex", cJSON_CreateString(""));
+                snprintf(buf, sizeof(buf), "0x%" PRIx64, x);
+                cJSON_ReplaceItemInObject(obj, "value_hex", cJSON_CreateString(buf));
+            }
+            return obj;
+        }
+    }
+
+    {
+        uint64_t raw = 0;
+        size_t sz = vartype_size_guess(t);
+        if (sz == 0 || sz > sizeof(raw)) sz = sizeof(raw);
+
+        if (safe_read_bytes(addr, &raw, sz) != 0) {
+            cJSON_AddStringToObject(obj, "value", "<read-error>");
+        } else {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "0x%" PRIx64, raw);
+            cJSON_AddStringToObject(obj, "value_hex", buf);
+        }
+    }
+
+    return obj;
+}
+
+/* -------------------- pointer / array / struct -------------------- */
+
+static cJSON *dump_pointer_json_real(const VarType *t, const void *addr, int depth)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "kind", "pointer");
+    cJSON_AddStringToObject(obj, "type_name", (t && t->name) ? t->name : "pointer");
+
+    void *p = NULL;
+    if (!addr || safe_read_ptr(addr, &p) != 0) {
+        cJSON_AddStringToObject(obj, "address", "<read-error>");
+        cJSON_AddStringToObject(obj, "pointee", "<unavailable>");
+        return obj;
+    }
+
+    if (!p) {
+        cJSON_AddNullToObject(obj, "address");
+        cJSON_AddNullToObject(obj, "pointee");
+        return obj;
+    }
+
+    char hexbuf[64];
+    snprintf(hexbuf, sizeof(hexbuf), "%p", p);
+    cJSON_AddStringToObject(obj, "address", hexbuf);
+
+    if (is_cstring_ptr(t)) {
+        char tmp[256];
+        memset(tmp, 0, sizeof(tmp));
+        if (safe_read_bytes(p, tmp, sizeof(tmp) - 1) != 0)
+            cJSON_AddStringToObject(obj, "string", "<read-error>");
+        else
+            cJSON_AddStringToObject(obj, "string", tmp);
+        return obj;
+    }
+
+    if (depth >= JSON_MAX_DEPTH) {
+        cJSON_AddStringToObject(obj, "pointee", "<max-depth>");
+        return obj;
+    }
+
+    cJSON_AddItemToObject(obj, "pointee",
+                          dump_value_json_real(t ? t->pointee : NULL, p, depth + 1));
+    return obj;
+}
+
+static cJSON *dump_array_json_real(const VarType *t, const void *addr, int depth)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "kind", "array");
+    cJSON_AddStringToObject(obj, "type_name", (t && t->name) ? t->name : "array");
+    cJSON_AddNumberToObject(obj, "length", (double)(t ? t->array_len : 0));
+
+    if (!addr) {
+        cJSON_AddNullToObject(obj, "value");
+        return obj;
+    }
+
+    t = vt_unwrap(t);
+    if (!t) {
+        cJSON_AddStringToObject(obj, "value", "<invalid-type>");
+        return obj;
+    }
+
+    if (is_cstring_array(t)) {
+        size_t n = t->array_len ? t->array_len : 256;
+        char *tmp = (char *)calloc(1, n + 1);
+        if (!tmp) {
+            cJSON_AddStringToObject(obj, "string", "<oom>");
+            return obj;
+        }
+
+        if (safe_read_bytes(addr, tmp, n) != 0)
+            cJSON_AddStringToObject(obj, "string", "<read-error>");
+        else
+            cJSON_AddStringToObject(obj, "string", tmp);
+
+        free(tmp);
+        return obj;
+    }
+
+    if (depth >= JSON_MAX_DEPTH) {
+        cJSON_AddStringToObject(obj, "value", "<max-depth>");
+        return obj;
+    }
+
+    cJSON *arr = cJSON_CreateArray();
+    cJSON_AddItemToObject(obj, "elements", arr);
+
+    size_t elem_sz = vartype_size_guess(t->element);
+    if (elem_sz == 0) elem_sz = sizeof(uint64_t);
+
+    size_t n = t->array_len;
+    if (n > JSON_MAX_ARRAY_ELEMS) n = JSON_MAX_ARRAY_ELEMS;
+
+    for (size_t i = 0; i < n; i++) {
+        const void *eaddr = (const uint8_t *)addr + i * elem_sz;
+        cJSON_AddItemToArray(arr, dump_value_json_real(t->element, eaddr, depth + 1));
+    }
+
+    if (t->array_len > JSON_MAX_ARRAY_ELEMS)
+        cJSON_AddItemToArray(arr, cJSON_CreateString("<truncated>"));
+
+    return obj;
+}
+
+static cJSON *dump_struct_union_json_real(const VarType *t, const void *addr, int depth, const char *kind_name)
+{
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "kind", kind_name);
+    cJSON_AddStringToObject(obj, "type_name", (t && t->name) ? t->name : "anonymous");
+
+    if (!addr) {
+        cJSON_AddNullToObject(obj, "value");
+        return obj;
+    }
+
+    if (depth >= JSON_MAX_DEPTH) {
+        cJSON_AddStringToObject(obj, "value", "<max-depth>");
+        return obj;
+    }
+
+    cJSON *members = cJSON_CreateObject();
+    cJSON_AddItemToObject(obj, "members", members);
+
+    for (size_t i = 0; i < t->n_members; i++) {
+        const StructMember *m = &t->members[i];
+        cJSON *mobj = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(mobj, "offset", (double)m->offset);
+
+        if (m->offset < 0) {
+            cJSON_AddStringToObject(mobj, "data", "<unknown-offset>");
+        } else {
+            const void *maddr = (const uint8_t *)addr + (size_t)m->offset;
+            cJSON_AddItemToObject(mobj, "data",
+                                  dump_value_json_real(m->type, maddr, depth + 1));
+        }
+
+        cJSON_AddItemToObject(members, m->name ? m->name : "<anon>", mobj);
+    }
+
+    return obj;
+}
+
+static cJSON *dump_value_json_real(const VarType *t, const void *addr, int depth)
+{
+    t = vt_unwrap(t);
+
+    if (!t) {
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddStringToObject(obj, "kind", "unknown");
+        cJSON_AddStringToObject(obj, "value", "<no-type>");
+        return obj;
+    }
+
+    switch (t->kind) {
+        case VT_BASE:
+        case VT_ENUM:
+            return dump_base_json_real(t, addr);
+
+        case VT_POINTER:
+            return dump_pointer_json_real(t, addr, depth);
+
+        case VT_ARRAY:
+            return dump_array_json_real(t, addr, depth);
+
+        case VT_STRUCT:
+            return dump_struct_union_json_real(t, addr, depth, "struct");
+
+        case VT_UNION:
+            return dump_struct_union_json_real(t, addr, depth, "union");
+
+        case VT_TYPEDEF:
+        case VT_QUALIFIER: {
+            cJSON *obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(obj, "kind", vk_name(t->kind));
+            cJSON_AddStringToObject(obj, "type_name", t->name ? t->name : "alias");
+            cJSON_AddItemToObject(obj, "underlying",
+                                  dump_value_json_real(t->under, addr, depth + 1));
+            return obj;
+        }
+
+        default: {
+            cJSON *obj = cJSON_CreateObject();
+            cJSON_AddStringToObject(obj, "kind", "unknown");
+            cJSON_AddStringToObject(obj, "type_name", t->name ? t->name : "unknown");
+            return obj;
+        }
+    }
+}
+
+/* -------------------- top-level API -------------------- */
+
+/*
+ * Returns malloc'ed JSON string.
+ * Caller must free().
+ *
+ * Assumption:
+ *   raw_args[i] is the raw machine argument value captured from registers/ABI.
+ *
+ * For:
+ *   - scalars passed by value: decode from &raw_args[i]
+ *   - pointers: decode from &raw_args[i], then pointer decoder dereferences it
+ *   - structs/unions passed indirectly: this works if raw_args[i] holds the address
+ *
+ * True by-value large aggregates are ABI-sensitive and may need a special case.
+ */
+char *funcsig_args_to_json(const FuncSig *sig, const uint64_t *raw_args)
+{
+    if (!sig || !raw_args) {
+        char *s = strdup("null");
+        return s;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+
+    cJSON_AddStringToObject(root, "function", sig->name ? sig->name : "<unknown>");
+    cJSON_AddNumberToObject(root, "argc", (double)sig->n_args);
+
+    cJSON *args = cJSON_CreateArray();
+    cJSON_AddItemToObject(root, "args", args);
+
+    for (size_t i = 0; i < sig->n_args; i++) {
+        cJSON *arg = cJSON_CreateObject();
+        cJSON_AddItemToArray(args, arg);
+
+        cJSON_AddNumberToObject(arg, "index", (double)i);
+
+        char argname[32];
+        snprintf(argname, sizeof(argname), "arg%zu", i);
+        cJSON_AddStringToObject(arg, "name", argname);
+
+        const VarType *t = sig->args ? sig->args[i] : NULL;
+        cJSON_AddStringToObject(arg, "type_kind", vk_name(t ? vt_unwrap(t)->kind : VT_UNKNOWN));
+        cJSON_AddStringToObject(arg, "type_name", (t && t->name) ? t->name : "<unnamed>");
+
+        char hexbuf[64];
+        snprintf(hexbuf, sizeof(hexbuf), "0x%" PRIx64, raw_args[i]);
+        cJSON_AddStringToObject(arg, "raw_hex", hexbuf);
+
+        uint64_t raw = raw_args[i];
+        const void *decode_addr = &raw;
+
+        /*
+         * If you want struct/union args to be treated as indirect objects by default,
+         * uncomment this:
+         *
+         * const VarType *u = vt_unwrap(t);
+         * if (u && (u->kind == VT_STRUCT || u->kind == VT_UNION || u->kind == VT_ARRAY))
+         *     decode_addr = (const void *)(uintptr_t)raw;
+         */
+
+        cJSON_AddItemToObject(arg, "decoded",
+                              dump_value_json_real(t, decode_addr, 0));
+    }
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    return out;
 }
 
 /* ======================= Demo pipeline usage ======================= */

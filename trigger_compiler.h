@@ -12,7 +12,7 @@
     * variables: argN or argN.member.submember
     * comparisons: == != < <= > >= (= is treated as ==)
     * boolean operations: && ||
-    * literals: int (10), hex (0x10), float (3.14), string ("abc")
+    * literals: int (10, -10), hex (0x10, -0x10), float (3.14, -3.14), string ("abc")
   
   See trigger_compiler.c for implementation details.
 */
@@ -72,7 +72,7 @@ typedef struct {
  *   - Variables: arg0, arg1, arg0.member, arg0.member.submember
  *   - Comparisons: ==, !=, <, <=, >, >=, = (treated as ==)
  *   - Boolean ops: && (AND), || (OR)
- *   - Literals: integers (42, 0x10), floats (3.14), strings ("hello")
+ *   - Literals: integers (42, -42, 0x10, -0x10), floats (3.14, -3.14), strings ("hello")
  *   - Parentheses for grouping: (arg0 > 5)
  *
  * Examples:
@@ -105,7 +105,7 @@ void compiled_trigger_free(CompiledTrigger *t);
  */
 int eval_compiled_trigger(const CompiledTrigger *t, const FuncSig *sig, const uint64_t *raw_args);
 
-
+char *funcsig_args_to_json(const FuncSig *sig, const uint64_t *raw_args);
 
 /* ======================= Demo pipeline ======================= */
 

@@ -41,7 +41,140 @@
 #include <linux/prctl.h>
 #include <signal.h>
 
-#define CONFIG_FILE_PATH "config.yaml"
+/* ------------------------- disk and ring buffer ------------------------- */
+#include <pthread.h>
+
+#define BUF_SIZE 65536
+
+typedef struct {
+    uint64_t time_ns;
+    uint64_t address;
+    uint64_t elapsed_time;
+} record_t;
+
+static record_t g_buf[BUF_SIZE];
+static size_t g_head = 0;
+static size_t g_tail = 0;
+static size_t g_count = 0;
+
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_cond = PTHREAD_COND_INITIALIZER;
+
+static pthread_t g_thread;
+static int g_thread_started = 0;
+static int g_stop = 0;
+
+static __thread int g_internal_thread = 0;
+
+static void *writer_thread_func(void *arg)
+{
+    FILE *fp;
+    (void)arg;
+
+    g_internal_thread = 1;
+
+    fp = fopen("/tmp/wyvern-data.csv", "w");
+    if (!fp) {
+        perror("fopen");
+        return NULL;
+    }
+
+    fprintf(fp, "time_ns,address,elapsed_time\n");
+    fflush(fp);
+
+    while (1) {
+        record_t rec;
+
+        pthread_mutex_lock(&g_lock);
+
+        while (g_count == 0 && !g_stop) {
+            pthread_cond_wait(&g_cond, &g_lock);
+        }
+
+        if (g_count == 0 && g_stop) {
+            pthread_mutex_unlock(&g_lock);
+            break;
+        }
+
+        rec = g_buf[g_tail];
+        g_tail = (g_tail + 1) % BUF_SIZE;
+        g_count--;
+
+        pthread_mutex_unlock(&g_lock);
+
+        fprintf(fp, "%llu,0x%llx,%llu\n",
+                (unsigned long long)rec.time_ns,
+                (unsigned long long)rec.address,
+                (unsigned long long)rec.elapsed_time);
+        fflush(fp);
+    }
+
+    fflush(fp);
+    fclose(fp);
+    return NULL;
+}
+
+void wyvern_start_thread(void)
+{
+    if (g_thread_started) {
+        return;
+    }
+
+    g_stop = 0;
+
+    if (pthread_create(&g_thread, NULL, writer_thread_func, NULL) != 0) {
+        perror("pthread_create");
+        return;
+    }
+
+    g_thread_started = 1;
+}
+
+void wyvern_stop_thread(void)
+{
+    if (!g_thread_started) {
+        return;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    g_stop = 1;
+    pthread_cond_signal(&g_cond);
+    pthread_mutex_unlock(&g_lock);
+
+    pthread_join(g_thread, NULL);
+    g_thread_started = 0;
+}
+
+void wyvern_push(uint64_t address, uint64_t elapsed_time)
+{
+    if (g_internal_thread) {
+        return;
+    }
+
+    if (!g_thread_started) {
+        wyvern_start_thread();
+    }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+
+    uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+    pthread_mutex_lock(&g_lock);
+
+    if (g_count < BUF_SIZE) {
+        g_buf[g_head].time_ns = now_ns;
+        g_buf[g_head].address = address;
+        g_buf[g_head].elapsed_time = elapsed_time;
+
+        g_head = (g_head + 1) % BUF_SIZE;
+        g_count++;
+
+        pthread_cond_signal(&g_cond);
+    }
+
+    pthread_mutex_unlock(&g_lock);
+}
 
 /* ------------------------- trigger & probes ------------------------- */
 static _Thread_local uint64_t tls_raw_args[64];
@@ -118,36 +251,12 @@ bool show_probe_trigger_hits = false;
 bool g_probe1_all_funcs_flag = false; // is installed or not, used for test/demo purposes
 Probe2Set p1set = {0};
 
-size_t failed_probe1_count = 0; size_t failed_probe2_count = 0;
-size_t succeded_probe1_count = 0; size_t succeded_probe2_count = 0;
-
-
-char *config_file_path = NULL;
-
 static uintptr_t program_base(void); // early fwd so we can use it above
 
 static void probe1(struct patch_exec_context *ctx, uint8_t ret);
 static void probe2(struct patch_exec_context *ctx, uint8_t ret);
 static void install_probe1(void *func_addr);
 static void print_libpatch_error(void);
-
-void write_accuracy_times(const char *filename) {
-    double probe1_success_rate = (succeded_probe1_count + failed_probe1_count) > 0 ?
-        (double)succeded_probe1_count / (succeded_probe1_count + failed_probe1_count) : 0.0;
-    double probe2_success_rate = (succeded_probe2_count + failed_probe2_count) > 0 ?
-        (double)succeded_probe2_count / (succeded_probe2_count + failed_probe2_count) : 0.0;
-
-    FILE *fp = fopen(filename, "w");
-    if (!fp) {
-        perror("fopen");
-        return;
-    }
-    fprintf(fp, "Probe1: %zu succeeded, %zu failed, %zu total, success rate: %.2f%%\n",
-            succeded_probe1_count, failed_probe1_count, (succeded_probe1_count + failed_probe1_count), probe1_success_rate * 100);
-    fprintf(fp, "Probe2: %zu succeeded, %zu failed, %zu total, success rate: %.2f%%\n",
-            succeded_probe2_count, failed_probe2_count, (succeded_probe2_count + failed_probe2_count), probe2_success_rate * 100);
-    fclose(fp);
-}
 
 
 /* ------------------------- x86 instruction classification ------------------------- */
@@ -286,10 +395,8 @@ static inline bool classify_x86_branch_dbg(csh handle, const cs_insn *insn, Jump
                 fprintf(stderr, " imm=0x%llx", (unsigned long long)op->imm);
                 js->imm_target = (uintptr_t)op->imm;
             } else if (op->type == X86_OP_REG) {
-                js->is_indirect = 1;
                 fprintf(stderr, " reg=%s", cs_reg_name(handle, op->reg));
             } else if (op->type == X86_OP_MEM) {
-                js->is_indirect = 1;
                 fprintf(stderr, " mem(base=%s index=%s scale=%d disp=0x%llx)",
                         cs_reg_name(handle, op->mem.base),
                         cs_reg_name(handle, op->mem.index),
@@ -298,7 +405,6 @@ static inline bool classify_x86_branch_dbg(csh handle, const cs_insn *insn, Jump
             }
             fprintf(stderr, "\n");
         }
-
         fprintf(stderr, "    => classified CALL imm_target=0x%llx\n",
                 (unsigned long long)js->imm_target);
         return true;
@@ -370,17 +476,9 @@ static inline bool classify_x86_branch(const cs_insn *insn, JumpSite *js) {
 
     if (is_call) {
         js->is_call = 1;
-
-        for (unsigned i = 0; i < d->x86.op_count; ++i) {
+        for (int i = 0; i < d->x86.op_count; ++i) {
             const cs_x86_op *op = &d->x86.operands[i];
-
-            if (op->type == X86_OP_IMM) {
-                js->imm_target = (uintptr_t)op->imm;
-            } else if (op->type == X86_OP_REG) {
-                js->is_indirect = 1;
-            } else if (op->type == X86_OP_MEM) {
-                js->is_indirect = 1;
-            }
+            if (op->type == X86_OP_IMM) { js->imm_target = (uintptr_t)op->imm; break; }
         }
         return true;
     }
@@ -439,16 +537,13 @@ static int find_function_jumps(const void *func_addr,
         JumpSite js;
         if (debug_mode){
             if (classify_x86_branch_dbg(handle, &insn[i], &js)) {
-                // if (!js.is_ret && !js.is_call) {         // <- keep only Jumps
-                //     sites[w++] = js;
-                // }
-                if (!js.is_ret) {         // <- keep only Jumps and calls
+                if (!js.is_ret && !js.is_call) {         // <- keep only Jumps
                     sites[w++] = js;
                 }
             }
         } else {
             if (classify_x86_branch(&insn[i], &js)) {
-                if (!js.is_ret) {         // <- keep only Jumps and calls
+                if (!js.is_ret && !js.is_call) {         // <- keep only Jumps
                     sites[w++] = js;
                 }
             }
@@ -522,19 +617,12 @@ int probe2_build_from_function(const void *func_addr,
     /* ***** end libpatch strategy ***** */
 
     for (size_t i = 0; i < n; ++i) {
-        
-        uintptr_t patch_addr;
-        if (sites[i].is_call) {
-            patch_addr = sites[i].insn_addr; // patch on the call instruction itself
-        } else {
-            patch_addr = sites[i].next_addr; // patch on the fallthrough after the branch
-        }
-
+        const uintptr_t site = sites[i].next_addr; // patch after the branch
         struct patch_location location = {
             .type        = PATCH_LOCATION_RANGE,
             .direction   = PATCH_LOCATION_FORWARD,
             .algorithm   = PATCH_LOCATION_FIRST,
-            .range.lower = patch_addr,
+            .range.lower = site,
             .range.upper = 0,
         };
         struct patch_exec_model exec_model = {
@@ -547,14 +635,7 @@ int probe2_build_from_function(const void *func_addr,
         };
         patch_status st = patch_make(&location, &exec_model, &attr,
                                      &set->patches[i], NULL);
-        // if (st == PATCH_OK) set->ready[i] = true; else print_libpatch_error();
-        if (st == PATCH_OK) {
-            set->ready[i] = true;
-            succeded_probe2_count++;
-        } else {
-            failed_probe2_count++;
-            print_libpatch_error();
-        }
+        if (st == PATCH_OK) set->ready[i] = true; else print_libpatch_error();
     }
 
     /* ***** libpatch strategy: cleanup attributes ***** */
@@ -750,45 +831,28 @@ static void fill_exe_path(void) {
 }
 
 static uintptr_t program_base(void) {
-    if (g_main_base)
-    {
-        if (g_main_base <= 0x400000) g_main_base = 0;
-        return g_main_base;
-    }
+    if (g_main_base) return g_main_base;
 
 #if HAVE_DLADDR1
     if (&main) {
         Dl_info dinfo; struct link_map *lm = NULL;
         if (dladdr1((void*)(uintptr_t)&main, &dinfo, (void**)&lm, RTLD_DL_LINKMAP) != 0 && lm) {
-            g_main_base = (uintptr_t)lm->l_addr; if (g_main_base <= 0x400000) g_main_base = 0; return g_main_base;
+            g_main_base = (uintptr_t)lm->l_addr; return g_main_base;
         }
     }
 #else
     if (&main) {
         Dl_info dinfo; if (dladdr((void*)(uintptr_t)&main, &dinfo) != 0 && dinfo.dli_fbase) {
-            g_main_base = (uintptr_t)dinfo.dli_fbase; if (g_main_base <= 0x400000) g_main_base = 0; return g_main_base;
+            g_main_base = (uintptr_t)dinfo.dli_fbase; return g_main_base;
         }
     }
 #endif
 
     fill_exe_path();
     dl_iterate_phdr(phdr_cb, g_exe_path);
-    if (g_main_base)
-    {
-        if (g_main_base <= 0x400000) g_main_base = 0;
-        return g_main_base;
-    }
+    if (g_main_base) return g_main_base;
 
-    if (g_exe_path[0]) 
-    { 
-        g_main_base = find_base_from_maps(g_exe_path);
-        if (g_main_base)
-        {
-            if (g_main_base <= 0x400000) g_main_base = 0;
-            return g_main_base;
-        }
-    }
-
+    if (g_exe_path[0]) { g_main_base = find_base_from_maps(g_exe_path); if (g_main_base) return g_main_base; }
     return 0;
 }
 
@@ -845,23 +909,8 @@ static void install_probe1(void *func_addr) {
     };
 
     patch_t patch;
-    // ensure_patch(patch_make, &location, &exec_model, NULL, &patch, NULL);
-    patch_status st = patch_make(&location, &exec_model, NULL, &patch, NULL);
-    if (st != PATCH_OK) {
-        failed_probe1_count++;
-        fprintf(stderr, "[probe1] patch_make failed with status %d\n", st);
-        print_libpatch_error();
-        return;
-    }
-    // ensure_patch(patch_enable, patch);
-    st = patch_enable(patch);
-    if (st != PATCH_OK) {
-        failed_probe1_count++;
-        fprintf(stderr, "[probe1] patch_enable failed with status %d\n", st);
-        print_libpatch_error();
-        return;
-    }
-    succeded_probe1_count++;
+    ensure_patch(patch_make, &location, &exec_model, NULL, &patch, NULL);
+    ensure_patch(patch_enable, patch);
     (void)patch_commit();
 }
 
@@ -885,43 +934,43 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         }
         Probe2Set *p2set = &g_probe_list.probe_addrs[probe_index].p2set;
 
-        GroupTriggerEntry *group = &trigger_db.groups[probe_index];
+        // GroupTriggerEntry *group = &trigger_db.groups[probe_index];
 
-        // Extract args ONCE for the whole group (Optimization)
-        uint64_t *raw_args = tls_raw_args;
-        const FuncSig *sig = group->sig;
-        int result = 0;
+        // // Extract args ONCE for the whole group (Optimization)
+        // uint64_t *raw_args = tls_raw_args;
+        // const FuncSig *sig = group->sig;
+        // int result = 0;
 
-        if (sig) {
-            extract_raw_args_sysv_x86_64(ctx, sig, raw_args);
+        // if (sig) {
+        //     extract_raw_args_sysv_x86_64(ctx, sig, raw_args);
 
-            // Iterate through all triggers in this group
-            for (size_t k = 0; k < group->n_entries; k++) {
-                TriggerEntry *entry = &group->entries[k];
+        //     // Iterate through all triggers in this group
+        //     for (size_t k = 0; k < group->n_entries; k++) {
+        //         TriggerEntry *entry = &group->entries[k];
 
-                if (entry->compiled_ok) {
-                    result = eval_compiled_trigger(&entry->compiled, sig, raw_args);
-                    if (result) break; // short-circuit on first match
-                }
-            }
-        }
+        //         if (entry->compiled_ok) {
+        //             result = eval_compiled_trigger(&entry->compiled, sig, raw_args);
+        //             if (result) break; // short-circuit on first match
+        //         }
+        //     }
+        // }
 
-        if (show_raw_args)
-        {
-            printf("[probe1-%zu]: raw args: ", probe_index);
-            for (size_t i = 0; i < sig->n_args; ++i) {
-                printf("%" PRIu64 " ", raw_args[i]);
-            }
-            printf("\n");
-        }
+        // if (show_raw_args)
+        // {
+        //     printf("[probe1-%zu]: raw args: ", probe_index);
+        //     for (size_t i = 0; i < sig->n_args; ++i) {
+        //         printf("%" PRIu64 " ", raw_args[i]);
+        //     }
+        //     printf("\n");
+        // }
 
-        if (show_probe_trigger_hits && result)
-            printf("[probe1-%zu]: eval triggered\n", probe_index);
+        // if (show_probe_trigger_hits && result)
+        //     printf("[probe1-%zu]: eval triggered\n", probe_index);
         
-        // // result = 1; // for testing, always enable probe2
-        if (mode_probe2_enabled) {
-            if (result) probe2_enable_all(p2set); else probe2_disable_all(p2set);
-        }
+        // // // result = 1; // for testing, always enable probe2
+        // if (mode_probe2_enabled) {
+        //     if (result) probe2_enable_all(p2set); else probe2_disable_all(p2set);
+        // }
 
         uint64_t d = rdtsc() - probe1_t0;
         atomic_fetch_add_explicit(&probe1_cycles, d, memory_order_relaxed);
@@ -934,6 +983,10 @@ static void probe1(struct patch_exec_context *ctx, uint8_t post) {
         atomic_fetch_add_explicit(&g_probe_time_stats.total_cycles, d, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_probe_time_stats.calls, 1, memory_order_relaxed);
         // printf("[probe_time]: function took %llu cycles\n", (unsigned long long)d);
+        // lttng_ust_tracepoint(wyvern, probe1, d);
+        uintptr_t pc = (uintptr_t)ctx->program_counter;
+        uint64_t offset = pc - program_base();
+        wyvern_push(offset, d);
     }
 }
 
@@ -986,6 +1039,64 @@ void print_test_summary(void) {
     }
 }
 
+static void dcft_print_banner(void)
+{
+    fprintf(stderr,
+        "\n"
+        "=====================================================================\n"
+        "  Dynamic Control Flow Tracer (DCFT)\n"
+        "  Architecture-Independent Runtime Instrumentation\n"
+        "=====================================================================\n"
+        "\n"
+        "██████╗  ██████╗ ███████╗████████╗\n"
+        "██╔══██╗██╔════╝ ██╔════╝╚══██╔══╝\n"
+        "██║  ██║██║      █████╗     ██║   \n"
+        "██║  ██║██║      ██╔══╝     ██║   \n"
+        "██████╔╝╚██████╗ ██║        ██║   \n"
+        "╚═════╝  ╚═════╝ ╚═╝        ╚═╝   \n"
+        "\n"
+        "Dynamic Control Flow Tracer (DCFT)\n"
+        "Built on libpatch for adaptive runtime tracing\n"
+        "\n"
+        "Copyright (c) 2026 Ali Entezari\n"
+        "Polytechnique Montréal - DORSAL Lab - MOOSE Lab\n"
+        "All rights reserved.\n"
+        "\n"
+        "=====================================================================\n"
+        "\n");
+}
+
+static void dcft_print_banner_basilisk(void)
+{
+    fprintf(stderr,
+        "\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "  Dynamic Control Flow Tracer (DCFT)\n"
+        "  Architecture-Independent Runtime Instrumentation\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "\n"
+        "    ██████╗  █████╗ ███████╗██╗██╗     ██╗███████╗██╗  ██╗\n"
+        "    ██╔══██╗██╔══██╗██╔════╝██║██║     ██║██╔════╝██║ ██╔╝\n"
+        "    ██████╔╝███████║███████╗██║██║     ██║███████╗█████╔╝ \n"
+        "    ██╔══██╗██╔══██║╚════██║██║██║     ██║╚════██║██╔═██╗ \n"
+        "    ██████╔╝██║  ██║███████║██║███████╗██║███████║██║  ██╗\n"
+        "    ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝╚══════╝╚═╝╚══════╝╚═╝  ╚═╝\n"
+        "\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "  BASILISK — BASILISK Adaptively Samples Instruction-level\n"
+        "             Logic In Software Kontrol-flow\n"
+        "\n"
+        "  Dynamic Control-Flow Tracer\n"
+        "  Architecture-independent • Trigger-driven • Adaptive\n"
+        "  Built on libpatch for adaptive runtime tracing\n"
+        "\n"
+        "  Copyright (c) 2026 Ali Entezari\n"
+        "  Polytechnique Montréal - DORSAL Lab - MOOSE Lab\n"
+        "  All rights reserved.\n"
+        "══════════════════════════════════════════════════════════════════\n"
+        "\n");
+}
+
 static void dcft_print_banner_wyvern(void)
 {
     fprintf(stderr,
@@ -1017,6 +1128,156 @@ static void dcft_print_banner_wyvern(void)
         "\n");
 }
 
+static int probe1_build_from_dwarf_function(Probe2Set *set,
+                               void (*handler)(struct patch_exec_context*, uint8_t),
+                               void *user_data)
+{
+    static DwarfModel *g_model = NULL;
+    static FuncOffTable g_fotab = {0};
+
+    g_model = dwarf_scan_collect_model();
+
+    dwarf_build_function_offset_table();
+    dwarf_update_function_offset_table_from_elf(/*include_plt=*/1);
+
+    g_fotab = *get_function_offset_table();
+
+    printf("══════════════════════════════════════════════════════════════════\n");
+    printf("Discovered %zu functions in the offset table.\n", g_fotab.len);
+
+    // remove @plt and _ and size 0 entries from the offset table
+    size_t write_index = 0;
+    for (size_t i = 0; i < g_fotab.len; i++) {
+        if (strstr(g_fotab.items[i].name, "@plt") ||
+            strcmp(g_fotab.items[i].name, "_start") == 0 ||
+            g_fotab.items[i].size == 0) {
+            continue; // skip this entry
+        }
+        if (write_index != i) {
+            g_fotab.items[write_index] = g_fotab.items[i]; // move valid entry to write_index
+        }
+        write_index++;
+    }
+    g_fotab.len = write_index; // update length to new count
+    size_t n = g_fotab.len;
+
+    // print offset table
+    for (size_t i = 0; i < g_fotab.len; i++) {
+        printf("Function: %s -> low_pc: 0x%llx, size: 0x%llx\n",
+               g_fotab.items[i].name,
+               (unsigned long long)g_fotab.items[i].lowpc,
+               (unsigned long long)g_fotab.items[i].size);
+    }
+    printf("══════════════════════════════════════════════════════════════════\n");
+    memset(set, 0, sizeof(*set));
+
+    set->patches = (patch_t*)calloc(n, sizeof(patch_t));
+    set->ready   = (bool*)calloc(n, sizeof(bool));
+    set->enabled = (bool*)calloc(n, sizeof(bool));
+    if (!set->patches || !set->ready || !set->enabled) {
+        free(set->patches); free(set->ready); free(set->enabled);
+        memset(set, 0, sizeof(*set));
+        return -ENOMEM;
+    }
+
+    /* ***** libpatch strategy: forbid trap-based patches (no SIGTRAP punning) ***** */
+    patch_attr   attr;
+    patch_status st_attr;
+
+    st_attr = patch_attr_init(&attr, sizeof(attr));
+    if (st_attr != PATCH_OK) {
+        print_libpatch_error();
+        free(set->patches); free(set->ready); free(set->enabled);
+        memset(set, 0, sizeof(*set));
+        return -EFAULT;
+    }
+
+    st_attr = patch_attr_set_trap_policy(&attr, PATCH_TRAP_POLICY_FORBID);
+    if (st_attr != PATCH_OK) {
+        print_libpatch_error();
+        patch_attr_fini(&attr);
+        free(set->patches); free(set->ready); free(set->enabled);
+        memset(set, 0, sizeof(*set));
+        return -EFAULT;
+    }
+
+    st_attr = patch_attr_set_abi(&attr, PATCH_ABI_OS);
+    if (st_attr != PATCH_OK) {
+        print_libpatch_error();
+        patch_attr_fini(&attr);
+        free(set->patches); free(set->ready); free(set->enabled);
+        memset(set, 0, sizeof(*set));
+        return -EFAULT;
+    }
+    /* ***** end libpatch strategy ***** */
+
+    for (size_t i = 0; i < n; ++i) {
+        const uintptr_t site = g_fotab.items[i].lowpc + program_base(); // patch at function entry
+        struct patch_location location = {
+            .type        = PATCH_LOCATION_RANGE,
+            .direction   = PATCH_LOCATION_FORWARD,
+            .algorithm   = PATCH_LOCATION_FIRST,
+            .range.lower = site,
+            .range.upper = 0,
+        };
+        struct patch_exec_model exec_model = {
+            .type                    = PATCH_EXEC_MODEL_PROBE_AROUND,
+            .probe.read_registers    = 0,
+            .probe.write_registers   = 0,
+            .probe.clobber_registers = PATCH_REGS_ALL,
+            .probe.user_data         = user_data,
+            .probe.procedure         = handler,
+        };
+        patch_status st = patch_make(&location, &exec_model, &attr,
+                                     &set->patches[i], NULL);
+        if (st == PATCH_OK) set->ready[i] = true; else print_libpatch_error();
+    }
+
+    /* ***** libpatch strategy: cleanup attributes ***** */
+    patch_attr_fini(&attr);
+    /* ***** end libpatch strategy ***** */
+
+    (void)patch_commit();
+    set->count = n;
+    return 0;
+}
+
+
+static void on_sig(int sig, siginfo_t *si, void *uc) {
+    (void)si; (void)uc;
+
+    printf("[wyvern] Signal received: %d\n", sig);
+    fflush(stdout);
+    if (sig == SIGUSR1+0) {
+        if (!g_probe1_all_funcs_flag) {
+            printf("[wyvern] Enabling all probe1 patches due to signal...\n");
+            probe2_enable_all(&p1set);
+            g_probe1_all_funcs_flag = true;
+        } else {
+            printf("[wyvern] All probe1 patches already enabled, ignoring signal.\n");
+        }
+    }
+
+    if (sig == SIGUSR1+1) {
+        if (g_probe1_all_funcs_flag) {
+            printf("[wyvern] Disabling all probe1 patches due to signal...\n");
+            probe2_disable_all(&p1set);
+            g_probe1_all_funcs_flag = false;
+        } else {
+            printf("[wyvern] All probe1 patches already disabled, ignoring signal.\n");
+        }
+    }
+}
+
+static void install_signal_handler(int sig) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = on_sig;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(sig, &sa, NULL);
+}
+
 
 /* ------------------------- constructor ------------------------- */
 
@@ -1026,73 +1287,72 @@ static void preload_init(void) {
     dcft_print_banner_wyvern();
     puts("[wyvern] DCFT (preloaded) initialising...");
 
-    config_file_path = getenv("WYVERN_CONFIG_PATH");
-    if (!config_file_path) {
-        config_file_path = CONFIG_FILE_PATH;
-    }
-
     calibrate_tsc();
     const struct patch_option options[] = {
         { .type = PATCH_OPT_ENABLE_WXE, .enable_wxe = 0 },
     };
     ensure_patch(patch_init, options, array_size(options));
 
-    triggerdb_setup(&trigger_db, config_file_path);
+    // triggerdb_setup(&trigger_db, "config.yaml");
 
-    /* Iterate over Groups instead of Entries */
-    for (size_t i = 0; i < trigger_db.n_groups; ++i) {
-        GroupTriggerEntry *group = &trigger_db.groups[i];
+    // /* Iterate over Groups instead of Entries */
+    // for (size_t i = 0; i < trigger_db.n_groups; ++i) {
+    //     GroupTriggerEntry *group = &trigger_db.groups[i];
 
-        /* Use group metadata */
-        if (group->func_size > 0) {
-            uintptr_t target_lowpc    = group->func_lowpc;
-            uintptr_t trigger_lowpc   = group->trigger_func_lowpc;
-            char *target_name         = group->func_name;
-            uint64_t target_size      = group->func_size > 0 ? group->func_size : target_func_max_bytes;
+    //     /* Use group metadata */
+    //     if (group->func_size > 0) {
+    //         uintptr_t target_lowpc    = group->func_lowpc;
+    //         uintptr_t trigger_lowpc   = group->trigger_func_lowpc;
+    //         char *target_name         = group->func_name;
+    //         uint64_t target_size      = group->func_size > 0 ? group->func_size : target_func_max_bytes;
 
-            /* Optional: Check if name already in the list (in case config has duplicate targets) */
-            int found = 0;
-            for (size_t j = 0; j < g_probe_list.n_probes; ++j) {
-                if (strcmp(g_probe_list.probe_addrs[j].target_name, target_name) == 0) {
-                    found = 1;
-                    break;
-                }
-            }
-            if (found) continue;
+    //         /* Optional: Check if name already in the list (in case config has duplicate targets) */
+    //         int found = 0;
+    //         for (size_t j = 0; j < g_probe_list.n_probes; ++j) {
+    //             if (strcmp(g_probe_list.probe_addrs[j].target_name, target_name) == 0) {
+    //                 found = 1;
+    //                 break;
+    //             }
+    //         }
+    //         if (found) continue;
 
-            /* Expand the probe list */
-            ProbeID *new_list = (ProbeID*)realloc(g_probe_list.probe_addrs,
-                                                  (g_probe_list.n_probes + 1) * sizeof(ProbeID));
-            if (!new_list) {
-                fprintf(stderr, "[probe2-config] failed to realloc probe addrs\n");
-                return;
-            }
-            g_probe_list.probe_addrs = new_list;
+    //         /* Expand the probe list */
+    //         ProbeID *new_list = (ProbeID*)realloc(g_probe_list.probe_addrs,
+    //                                               (g_probe_list.n_probes + 1) * sizeof(ProbeID));
+    //         if (!new_list) {
+    //             fprintf(stderr, "[probe2-config] failed to realloc probe addrs\n");
+    //             return;
+    //         }
+    //         g_probe_list.probe_addrs = new_list;
 
-            /* Register the probe using Group data */
-            ProbeID *p = &g_probe_list.probe_addrs[g_probe_list.n_probes];
+    //         /* Register the probe using Group data */
+    //         ProbeID *p = &g_probe_list.probe_addrs[g_probe_list.n_probes];
             
-            p->target_addr  = program_base() + target_lowpc;
-            p->trigger_addr = program_base() + trigger_lowpc;
-            p->target_name  = target_name;
-            p->target_size  = target_size;
-            p->p2set        = (Probe2Set){0};
-            p->index        = i; /* Store the GROUP index here, not the entry index */
+    //         p->target_addr  = program_base() + target_lowpc;
+    //         p->trigger_addr = program_base() + trigger_lowpc;
+    //         p->target_name  = target_name;
+    //         p->target_size  = target_size;
+    //         p->p2set        = (Probe2Set){0};
+    //         p->index        = i; /* Store the GROUP index here, not the entry index */
             
-            g_probe_list.n_probes++;
-        }
-    }
+    //         g_probe_list.n_probes++;
+    //     }
+    // }
 
-    if (mode_probe2_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
-        probe2_configure_all(&g_probe_list.probe_addrs[i]); // enabled on demand by probe1
-    }
-    if (mode_probe1_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
-        install_probe1((void*)g_probe_list.probe_addrs[i].trigger_addr);
-    }
-    write_accuracy_times("probe_succcess_rates.txt");
+    // if (mode_probe2_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
+    //     probe2_configure_all(&g_probe_list.probe_addrs[i]); // enabled on demand by probe1
+    // }
+    // if (mode_probe1_enabled) for (size_t i = 0; i < g_probe_list.n_probes; ++i) {
+    //     install_probe1((void*)g_probe_list.probe_addrs[i].trigger_addr);
+    // }
+
+    probe1_build_from_dwarf_function(&p1set, &probe1, &exit_value);
+    install_signal_handler(SIGUSR1+0); // signal to enable all probe1 patches
+    install_signal_handler(SIGUSR1+1); // signal to disable all probe1 patches
 
     uintptr_t addr = program_base();
     printf("[wyvern] DCFT: main executable base address: 0x%" PRIxPTR "\n", addr);
+    wyvern_start_thread();
 }
 
 /* ------------------------- destructor ------------------------- */
@@ -1107,8 +1367,7 @@ static void preload_fini(void) {
     print_test_summary();
 
     puts("[wyvern] DCFT cleanup complete.");
-    exit_value = 0;
-    exit(exit_value);
+    wyvern_stop_thread();
 }
 
 
@@ -1135,8 +1394,8 @@ uintptr_t base_address_for_pid(pid_t pid) {
 /* ------------------------- build hints ------------------------- */
 /*
 Compile:
-  gcc -shared -fPIC cft-auto-data-test.c lttng_tp.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch -llttng-ust
+  gcc -shared -fPIC -pthread cft-auto-data-test-internal.c lttng_tp.c trigger_check.c trigger_compiler.c trace_config.c -o cft-auto-data-test-internal.so -I. -L. -ldwscan -Wl,-rpath,'$ORIGIN' -lyaml -ldl -lcapstone -lpatch -llttng-ust
 Run:
-  LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
-  LD_PRELOAD=$PWD/cft-auto-data-test.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/data/test/input/inp.in
+  LD_PRELOAD=$PWD/cft-auto-data-test-internal.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/inp.in
+  LD_PRELOAD=$PWD/cft-auto-data-test-internal.so ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/run/run_base_refrate_ali-test1-m64.0000/mcf_r_base.ali-test1-m64 ~/Codes/cpu2017/benchspec/CPU/505.mcf_r/data/test/input/inp.in
 */

@@ -47,3 +47,8 @@ TraceCondition:
       - "*arg1 == 99"
       # - "**arg2 == 99"
       # - "arg3.a == 10"
+  - Func: main
+    Recursive: false
+    TriggerFunc: main
+    Triggers:
+      - "1 == 1"

@@ -65,6 +65,10 @@ int main() {
     // test null pointer
     func_ptr(NULL, NULL, NULL, NULL);
 
+    // pointer to function func_int
+    void (*func_ptr_to_func_int)(int, long, float, double, char, short, unsigned int) = func_int;
+    func_ptr_to_func_int(1, 2L, 3.0f, 4.0, 'B', 8, 654321U);
+
     return 0;
 }
 
