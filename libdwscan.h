@@ -210,6 +210,12 @@ int dwarf_update_function_offset_table_from_elf(int include_plt);
  */
 int dwarf_find_function_lowpc(const char *func_name, uint64_t *out_lowpc, uint64_t *out_size);
 
+/* Lookup function name by low_pc. */
+int dwarf_find_function_name_by_lowpc(uint64_t lowpc, const char **out_name, uint64_t *out_size);
+
+/* Quiet lookup by low_pc returning name and size if present. */
+int dwarf_lookup_function_by_lowpc(uint64_t lowpc, const char **out_name, uint64_t *out_size);
+
 /* Get a pointer to the function offset table (for read-only access). */
 FuncOffTable *get_function_offset_table(void);
 

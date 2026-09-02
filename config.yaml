@@ -1,6 +1,8 @@
 TraceCondition:
   LogsDir: ./tracer_logs
   Targets:
+  # Each target needs either Func or FuncOffset.
+  # Each trigger function needs either TriggerFunc or TriggerOffset.
   # - Func: price_out_impl
   #   Recursive: false
   #   TriggerFunc: price_out_impl

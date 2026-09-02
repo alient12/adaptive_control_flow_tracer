@@ -1,5 +1,8 @@
 #include "trace_config.h"
 
+#include <errno.h>
+#include <stdint.h>
+
 
 char *xstrdup(const char *s)
 {
@@ -57,14 +60,37 @@ static TargetCfg *cfg_add_target(TraceConditionCfg *cfg)
     return t;
 }
 
+static int parse_u64_scalar(const char *s, uint64_t *out)
+{
+    if (!s || !*s || !out) return -1;
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (errno != 0 || end == s || *end != '\0') return -1;
+
+    *out = (uint64_t)v;
+    return 0;
+}
+
+static int target_is_valid(const TargetCfg *t)
+{
+    if (!t) return 0;
+    if (!t->func && !t->has_func_lowpc) return 0;
+    if (!t->trigger_func && !t->has_trigger_func_lowpc) return 0;
+    return 1;
+}
+
 /* Schema-aware loader for:
 
 TraceCondition:
   LogsDir: ./tracer_logs
   Targets:
   - Func: update_tree
+        # FuncOffset: 0x1234
     Recursive: false
     TriggerFunc: update_tree
+        # TriggerOffset: 0x1234
     Triggers:
       - arg0 == 10 && arg1 < 20
       - arg5.orientation = 2 || arg5.child.orientation = 3
@@ -87,6 +113,7 @@ int load_trace_config(const char *path, TraceConditionCfg *out)
 
     char *pending_key = NULL;
     TargetCfg *cur = NULL;
+    int rc = -1;
 
     for (;;) {
         if (!yaml_parser_parse(&parser, &ev)) break;
@@ -101,13 +128,36 @@ int load_trace_config(const char *path, TraceConditionCfg *out)
                 free(pending_key); pending_key = xstrdup(s);
             } else if (st == ST_TC && strcmp(s, "Targets") == 0) {
                 st = ST_TARGETS;
-            } else if ((st == ST_TARGETS || st == ST_TARGET) && strcmp(s, "Func") == 0) {
-                free(pending_key); pending_key = xstrdup(s);
+            } else if ((st == ST_TARGETS || st == ST_TARGET) &&
+                       (strcmp(s, "Func") == 0 || strcmp(s, "FuncOffset") == 0 ||
+                        strcmp(s, "Recursive") == 0 || strcmp(s, "TriggerFunc") == 0 ||
+                        strcmp(s, "TriggerOffset") == 0 || strcmp(s, "Triggers") == 0)) {
                 if (!cur) cur = cfg_add_target(out);
+                if (!cur) {
+                    yaml_event_delete(&ev);
+                    goto done;
+                }
                 st = ST_TARGET;
+                if (strcmp(s, "Func") == 0) {
+                    free(pending_key); pending_key = xstrdup(s);
+                } else if (strcmp(s, "FuncOffset") == 0) {
+                    free(pending_key); pending_key = xstrdup(s);
+                } else if (strcmp(s, "Recursive") == 0) {
+                    free(pending_key); pending_key = xstrdup(s);
+                } else if (strcmp(s, "TriggerFunc") == 0) {
+                    free(pending_key); pending_key = xstrdup(s);
+                } else if (strcmp(s, "TriggerOffset") == 0) {
+                    free(pending_key); pending_key = xstrdup(s);
+                } else if (strcmp(s, "Triggers") == 0) {
+                    st = ST_TRIGGERS;
+                }
             } else if (st == ST_TARGET && strcmp(s, "Recursive") == 0) {
                 free(pending_key); pending_key = xstrdup(s);
+            } else if (st == ST_TARGET && strcmp(s, "FuncOffset") == 0) {
+                free(pending_key); pending_key = xstrdup(s);
             } else if (st == ST_TARGET && strcmp(s, "TriggerFunc") == 0) {
+                free(pending_key); pending_key = xstrdup(s);
+            } else if (st == ST_TARGET && strcmp(s, "TriggerOffset") == 0) {
                 free(pending_key); pending_key = xstrdup(s);
             } else if (st == ST_TARGET && strcmp(s, "Triggers") == 0) {
                 st = ST_TRIGGERS;
@@ -123,6 +173,14 @@ int load_trace_config(const char *path, TraceConditionCfg *out)
                 cur->func = xstrdup(s);
                 free(pending_key); pending_key = NULL;
             }
+            else if (pending_key && cur && strcmp(pending_key, "FuncOffset") == 0) {
+                if (parse_u64_scalar(s, &cur->func_lowpc) != 0) {
+                    yaml_event_delete(&ev);
+                    goto done;
+                }
+                cur->has_func_lowpc = true;
+                free(pending_key); pending_key = NULL;
+            }
             else if (pending_key && cur && strcmp(pending_key, "Recursive") == 0) {
                 cur->recursive = (strcmp(s, "true") == 0) ? 1 : 0;
                 free(pending_key); pending_key = NULL;
@@ -130,6 +188,14 @@ int load_trace_config(const char *path, TraceConditionCfg *out)
             else if (pending_key && cur && strcmp(pending_key, "TriggerFunc") == 0) {
                 free(cur->trigger_func);
                 cur->trigger_func = xstrdup(s);
+                free(pending_key); pending_key = NULL;
+            }
+            else if (pending_key && cur && strcmp(pending_key, "TriggerOffset") == 0) {
+                if (parse_u64_scalar(s, &cur->trigger_func_lowpc) != 0) {
+                    yaml_event_delete(&ev);
+                    goto done;
+                }
+                cur->has_trigger_func_lowpc = true;
                 free(pending_key); pending_key = NULL;
             }
             else if (st == ST_TRIGGERS && cur) {
@@ -144,6 +210,11 @@ int load_trace_config(const char *path, TraceConditionCfg *out)
 
         if (ev.type == YAML_MAPPING_END_EVENT && st == ST_TARGET) {
             /* End of one target mapping: next list item will create new target */
+            if (!target_is_valid(cur)) {
+                fprintf(stderr, "invalid target: Func/FuncOffset and TriggerFunc/TriggerOffset are each required\n");
+                yaml_event_delete(&ev);
+                goto done;
+            }
             cur = NULL;
             st = ST_TARGETS;
         }
@@ -156,19 +227,43 @@ int load_trace_config(const char *path, TraceConditionCfg *out)
         yaml_event_delete(&ev);
     }
 
+    if (cur || st == ST_TARGET) {
+        if (!target_is_valid(cur)) {
+            fprintf(stderr, "invalid target: Func/FuncOffset and TriggerFunc/TriggerOffset are each required\n");
+            goto done;
+        }
+    }
+
+    rc = 0;
+
+done:
     free(pending_key);
     yaml_parser_delete(&parser);
     fclose(fp);
-
-    return 0;
+    if (rc != 0) cfg_free(out);
+    return rc;
 }
 
-const TargetCfg *cfg_find_target(const TraceConditionCfg *cfg, const char *func_name)
+const TargetCfg *cfg_find_target(const TraceConditionCfg *cfg, const char *func_name, const uint64_t *func_lowpc)
 {
-    if (!cfg || !func_name) return NULL;
+    if (!cfg) return NULL;
     for (size_t i = 0; i < cfg->n_targets; i++) {
-        if (cfg->targets[i].func && strcmp(cfg->targets[i].func, func_name) == 0)
-            return &cfg->targets[i];
+        const TargetCfg *t = &cfg->targets[i];
+
+        if (t->func) {
+            if (!func_name || strcmp(t->func, func_name) != 0)
+                continue;
+        }
+
+        if (t->has_func_lowpc) {
+            if (!func_lowpc || *func_lowpc != t->func_lowpc)
+                continue;
+        }
+
+        if (!t->func && !t->has_func_lowpc)
+            continue;
+
+        return t;
     }
     return NULL;
 }

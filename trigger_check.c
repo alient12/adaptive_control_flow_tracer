@@ -223,6 +223,58 @@ static char *tc_strdup_local(const char *s) {
     return p;
 }
 
+typedef struct {
+    char *name;
+    uint64_t lowpc;
+    uint64_t size;
+} ResolvedFunction;
+
+static void resolved_function_free(ResolvedFunction *f)
+{
+    if (!f) return;
+    free(f->name);
+    memset(f, 0, sizeof(*f));
+}
+
+static char *tc_label_from_lowpc(uint64_t lowpc)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "<lowpc=0x%llx>", (unsigned long long)lowpc);
+    return strdup(buf);
+}
+
+static int resolve_function_identity(const char *configured_name,
+                                     int has_lowpc,
+                                     uint64_t configured_lowpc,
+                                     ResolvedFunction *out)
+{
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    if (has_lowpc) {
+        const char *resolved_name = NULL;
+        out->lowpc = configured_lowpc;
+        if (dwarf_lookup_function_by_lowpc(configured_lowpc, &resolved_name, &out->size) == 0 && resolved_name) {
+            out->name = tc_strdup_local(resolved_name);
+        } else if (configured_name && configured_name[0]) {
+            out->name = tc_strdup_local(configured_name);
+        } else {
+            out->name = tc_label_from_lowpc(configured_lowpc);
+        }
+        return 0;
+    }
+
+    if (configured_name && configured_name[0]) {
+        out->name = tc_strdup_local(configured_name);
+        if (dwarf_find_function_lowpc(configured_name, &out->lowpc, &out->size) != 0) {
+            out->lowpc = 0;
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
 static void triggerdb_free(TriggerDB *db)
 {
     if (!db) return;
@@ -304,14 +356,21 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
         /* Point to the current group in the DB */
         GroupTriggerEntry *group = &db->groups[ti];
 
-        uint64_t func_off = 0, func_size = 0;
-        uint64_t trig_off = 0, trig_size = 0;
-        
-        (void)dwarf_find_function_lowpc(t->func, &func_off, &func_size);
-        (void)dwarf_find_function_lowpc(t->trigger_func, &trig_off, &trig_size);
+        ResolvedFunction target_fn = {0};
+        ResolvedFunction trigger_fn = {0};
+
+        (void)resolve_function_identity(t->func, t->has_func_lowpc, t->func_lowpc, &target_fn);
+        (void)resolve_function_identity(t->trigger_func, t->has_trigger_func_lowpc, t->trigger_func_lowpc, &trigger_fn);
 
         printf("[triggerdb-setup] Target %zu: Func=%s, Offset=0x%lx, Size=0x%lx, Recursive=%d, TriggerFunc=%s, TriggerOffset=0x%lx, TriggerSize=0x%lx, Triggers=[",
-               ti, t->func, func_off, func_size, t->recursive, t->trigger_func, trig_off, trig_size);
+               ti,
+               target_fn.name ? target_fn.name : "<unknown>",
+               (unsigned long)target_fn.lowpc,
+               (unsigned long)target_fn.size,
+               t->recursive,
+               trigger_fn.name ? trigger_fn.name : "<unknown>",
+               (unsigned long)trigger_fn.lowpc,
+               (unsigned long)trigger_fn.size);
         for (size_t j = 0; j < t->triggers.n; j++) {
             printf("%s\"%s\"", (j > 0) ? ", " : "", t->triggers.items[j]);
         }
@@ -320,22 +379,25 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
         /* 1. Fill Group Metadata (Common info) */
         group->target_i = ti;
         
-        group->func_name  = tc_strdup_local(t->func);
-        group->func_lowpc = func_off;
-        group->func_size  = func_size;
+        group->func_name  = target_fn.name;
+        target_fn.name = NULL;
+        group->func_lowpc = target_fn.lowpc;
+        group->func_size  = target_fn.size;
 
-        group->trigger_func_name  = tc_strdup_local(t->trigger_func);
-        group->trigger_func_lowpc = trig_off;
-        group->trigger_func_size  = trig_size;
+        group->trigger_func_name  = trigger_fn.name;
+        trigger_fn.name = NULL;
+        group->trigger_func_lowpc = trigger_fn.lowpc;
+        group->trigger_func_size  = trigger_fn.size;
 
         group->recursive = t->recursive;
 
         /* Find FuncSig once per group */
-        const FuncSig *sig = find_funcsig_by_name(db->model, t->trigger_func);
+        const FuncSig *sig = group->trigger_func_name ? find_funcsig_by_name(db->model, group->trigger_func_name) : NULL;
         group->sig = sig;
 
         if (!sig) {
-            printf("[Error] no FuncSig found for trigger function '%s'\n", t->trigger_func);
+            printf("[Error] no FuncSig found for trigger function '%s'\n",
+                   group->trigger_func_name ? group->trigger_func_name : "<unknown>");
         }
 
         /* 2. Allocate Entries for this Group */
@@ -358,10 +420,15 @@ int triggerdb_setup(TriggerDB *db, const char *cfg_path)
                 } else {
                     e->compiled_ok = 0;
                     printf("[Error] failed to compile trigger[%zu] for %s: %s\n",
-                           k, t->trigger_func, t->triggers.items[k]);
+                           k,
+                           group->trigger_func_name ? group->trigger_func_name : "<unknown>",
+                           t->triggers.items[k]);
                 }
             }
         }
+
+        resolved_function_free(&target_fn);
+        resolved_function_free(&trigger_fn);
     }
 
     return 0;
@@ -428,14 +495,24 @@ void demo()
         GroupTriggerEntry *group = &db.groups[i];
 
         // --- Fill Group Metadata ---
+        ResolvedFunction target_fn = {0};
+        ResolvedFunction trigger_fn = {0};
+
+        (void)resolve_function_identity(t->func, t->has_func_lowpc, t->func_lowpc, &target_fn);
+        (void)resolve_function_identity(t->trigger_func, t->has_trigger_func_lowpc, t->trigger_func_lowpc, &trigger_fn);
+
         group->target_i = i;
-        group->func_name = tc_strdup_local(t->func);
-        group->trigger_func_name = tc_strdup_local(t->trigger_func);
+        group->func_name = target_fn.name;
+        target_fn.name = NULL;
+        group->trigger_func_name = trigger_fn.name;
+        trigger_fn.name = NULL;
         group->recursive = t->recursive;
-        group->sig = find_funcsig_by_name(db.model, t->trigger_func);
+        group->sig = group->trigger_func_name ? find_funcsig_by_name(db.model, group->trigger_func_name) : NULL;
         
-        dwarf_find_function_lowpc(t->func, &group->func_lowpc, &group->func_size);
-        dwarf_find_function_lowpc(t->trigger_func, &group->trigger_func_lowpc, &group->trigger_func_size);
+        group->func_lowpc = target_fn.lowpc;
+        group->func_size = target_fn.size;
+        group->trigger_func_lowpc = trigger_fn.lowpc;
+        group->trigger_func_size = trigger_fn.size;
 
         // --- Fill Entries ---
         group->n_entries = t->triggers.n;
@@ -457,6 +534,9 @@ void demo()
                 }
             }
         }
+
+        resolved_function_free(&target_fn);
+        resolved_function_free(&trigger_fn);
     }
 
     /* 3. Demonstrate Access by Group */

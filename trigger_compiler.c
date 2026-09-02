@@ -1857,7 +1857,13 @@ void demo_pipeline(const char *func_name)
         return;
     }
 
-    const TargetCfg *t = cfg_find_target(&cfg, func_name);
+    uint64_t func_lowpc = 0, func_size = 0;
+    const uint64_t *func_lowpc_ptr = NULL;
+    if (dwarf_find_function_lowpc(func_name, &func_lowpc, &func_size) == 0) {
+        func_lowpc_ptr = &func_lowpc;
+    }
+
+    const TargetCfg *t = cfg_find_target(&cfg, func_name, func_lowpc_ptr);
     if (!t) {
         printf("[demo] no target rule for %s\n", func_name);
         cfg_free(&cfg);

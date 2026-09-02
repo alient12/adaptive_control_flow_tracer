@@ -955,6 +955,23 @@ static void probe2(struct patch_exec_context *ctx, uint8_t post) {
     }
 }
 
+static int probe_target_exists(uintptr_t target_lowpc, const char *target_name)
+{
+    for (size_t j = 0; j < g_probe_list.n_probes; ++j) {
+        const ProbeID *existing = &g_probe_list.probe_addrs[j];
+
+        if (existing->target_addr == program_base() + target_lowpc) {
+            return 1;
+        }
+
+        if (target_name && existing->target_name && strcmp(existing->target_name, target_name) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 /* ------------------------- summary ------------------------- */
 
 /* report collected timing results */
@@ -1043,22 +1060,27 @@ static void preload_init(void) {
     for (size_t i = 0; i < trigger_db.n_groups; ++i) {
         GroupTriggerEntry *group = &trigger_db.groups[i];
 
-        /* Use group metadata */
-        if (group->func_size > 0) {
-            uintptr_t target_lowpc    = group->func_lowpc;
-            uintptr_t trigger_lowpc   = group->trigger_func_lowpc;
-            char *target_name         = group->func_name;
-            uint64_t target_size      = group->func_size > 0 ? group->func_size : target_func_max_bytes;
+        /* Use group metadata. Offset-only entries are accepted as long as we have a lowpc. */
+        if (group->func_lowpc != 0 || group->func_size > 0) {
+            uintptr_t target_lowpc  = group->func_lowpc;
+            uintptr_t trigger_lowpc = group->trigger_func_lowpc;
+            const char *target_name = group->func_name ? group->func_name : "<unknown>";
+            uint64_t target_size    = group->func_size;
 
-            /* Optional: Check if name already in the list (in case config has duplicate targets) */
-            int found = 0;
-            for (size_t j = 0; j < g_probe_list.n_probes; ++j) {
-                if (strcmp(g_probe_list.probe_addrs[j].target_name, target_name) == 0) {
-                    found = 1;
-                    break;
+            if (target_size == 0 && target_lowpc != 0) {
+                const char *resolved_name = NULL;
+                uint64_t resolved_size = 0;
+                if (dwarf_lookup_function_by_lowpc((uint64_t)target_lowpc, &resolved_name, &resolved_size) == 0 && resolved_size > 0) {
+                    target_size = resolved_size;
                 }
             }
-            if (found) continue;
+
+            if (target_size == 0) {
+                target_size = target_func_max_bytes;
+            }
+
+            /* Optional: check if this target is already registered. */
+            if (probe_target_exists(target_lowpc, target_name)) continue;
 
             /* Expand the probe list */
             ProbeID *new_list = (ProbeID*)realloc(g_probe_list.probe_addrs,
@@ -1074,7 +1096,7 @@ static void preload_init(void) {
             
             p->target_addr  = program_base() + target_lowpc;
             p->trigger_addr = program_base() + trigger_lowpc;
-            p->target_name  = target_name;
+            p->target_name  = group->func_name;
             p->target_size  = target_size;
             p->p2set        = (Probe2Set){0};
             p->index        = i; /* Store the GROUP index here, not the entry index */

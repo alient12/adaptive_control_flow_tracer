@@ -1005,6 +1005,40 @@ int dwarf_find_function_lowpc(const char *func_name, uint64_t *out_lowpc, uint64
     return 1;
 }
 
+int dwarf_find_function_name_by_lowpc(uint64_t lowpc, const char **out_name, uint64_t *out_size)
+{
+    if (!out_name) return 1;
+    if (dwarf_build_function_offset_table() != 0) return 1;
+
+    for (size_t i = 0; i < g_fotab.len; i++) {
+        if (g_fotab.items[i].lowpc == lowpc) {
+            *out_name = g_fotab.items[i].name;
+            if (out_size) *out_size = g_fotab.items[i].size;
+            return 0;
+        }
+    }
+
+    printf("dwarf_find_function_name_by_lowpc: lowpc 0x%llx not found in FOTAB\n",
+           (unsigned long long)lowpc);
+    return 1;
+}
+
+int dwarf_lookup_function_by_lowpc(uint64_t lowpc, const char **out_name, uint64_t *out_size)
+{
+    if (!out_name) return 1;
+    if (dwarf_build_function_offset_table() != 0) return 1;
+
+    for (size_t i = 0; i < g_fotab.len; i++) {
+        if (g_fotab.items[i].lowpc == lowpc) {
+            *out_name = g_fotab.items[i].name;
+            if (out_size) *out_size = g_fotab.items[i].size;
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 /* ------------------------------ ELF symbol table (augment offset table) ------------------------------ */
 
 /*
